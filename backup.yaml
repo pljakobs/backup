@@ -1,0 +1,146 @@
+# Backup Configuration with path-level scripts
+config:
+  backup_base: "/share/backup/"
+  lock_file: "/tmp/backup.fil"
+  rsync_options: "-avz --delete"
+  
+snapshots:
+  volume: "/share"
+  schedules:
+    - type: "hourly"
+      count: 6
+      interval: 14400
+    - type: "daily" 
+      count: 7
+      interval: 86400
+    - type: "weekly"
+      count: 4
+      interval: 604800
+    - type: "monthly"
+      count: 12
+      interval: 2592000
+    - type: "yearly"
+      count: 4
+      interval: 31536000
+      
+hosts:
+  fhem2:
+    hostname: fhem2
+    ssh_user: pjakobs
+    ssh_key: /home/pjakobs/.ssh/id_ed25519
+    rsync_path: sudo rsync
+    exclude_file: /etc/backup/lin-excludes.txt
+    paths:
+      - path: /etc
+      - path: /opt/docker
+      - path: /opt/fhem
+
+  labpc:
+    hostname: labpc
+    ssh_user: pjakobs
+    ssh_key: /home/pjakobs/.ssh/id_ed25519
+    exclude_file: /etc/backup/lin-excludes.txt
+    paths:
+      - path: /etc
+        rsync_path: sudo rsync
+      - path: /home/pjakobs
+
+  fotopc:
+    hostname: fotopc
+    ssh_user: fotopc
+    ssh_key: /home/pjakobs/.ssh/id_ed25519
+    exclude_file: /etc/backup/win-excludes.txt
+    paths:
+      - path: /cygdrive/c/Users/cn-0f27dt-f1167-1bi-
+        dest_subdir: c
+      - path: /cygdrive/d
+        dest_subdir: d
+      - path: /cygdrive/e
+        dest_subdir: e
+
+  nasbox:
+    hostname: nasbox
+    ssh_user: ""  # local backup
+    ssh_key: ""
+    exclude_file: /etc/backup/lin-excludes.txt
+    paths:
+      - path: /etc
+        rsync_path: sudo rsync
+      - path: /usr/local/bin
+      - path: /home/pjakobs
+
+  bigbox:
+    hostname: bigbox
+    ssh_user: pjakobs
+    ssh_key: /home/pjakobs/.ssh/id_ed25519
+    rsync_path: sudo rsync
+    exclude_file: /etc/backup/lin-excludes.txt
+    paths:
+      - path: /etc
+      - path: /home/pjakobs
+      - path: /home/media
+
+  ThinkPad:
+    hostname: ThinkPad
+    ssh_user: pjakobs
+    ssh_key: /home/pjakobs/.ssh/id_ed25519
+    rsync_path: sudo rsync
+    exclude_file: /etc/backup/lin-excludes.txt
+    paths:
+      - path: /home/pjakobs
+
+  T460:
+    hostname: T460
+    ssh_user: pjakobs
+    ssh_key: /home/pjakobs/.ssh/id_ed25519
+    rsync_path: sudo rsync
+    exclude_file: /etc/backup/lin-excludes.txt
+    paths:
+      - path: /home/pjakobs
+
+  devbox:
+    hostname: devbox
+    ssh_user: pjakobs
+    ssh_key: /home/pjakobs/.ssh/id_ed25519
+    rsync_path: sudo rsync
+    exclude_file: /etc/backup/lin-excludes.txt
+    paths:
+      - path: /home/pjakobs
+      - path: /opt/sming
+
+  lightinator:
+    hostname: lightinator.de
+    ssh_user: pjakobs
+    ssh_key: /home/pjakobs/.ssh/id_ed25519
+    rsync_path: sudo rsync
+    exclude_file: /etc/backup/lin-excludes.txt
+    paths:
+      - path: /home/pjakobs
+      - path: /etc
+
+  nextcloud:
+    hostname: nextcloud.fritz.box
+    ssh_user: pjakobs
+    ssh_key: /home/pjakobs/.ssh/id_ed25519
+    rsync_path: sudo rsync
+    exclude_file: /etc/backup/lin-excludes.txt
+    paths:
+      - path: /var/lib/mysql
+      - path: /var/www
+      - path: /etc
+
+  # Example with database backup workflow
+#  database-server:
+#    hostname: db.example.com
+#    ssh_user: dbadmin
+#    ssh_key: /home/pjakobs/.ssh/id_ed25519
+#    rsync_path: sudo rsync
+#    exclude_file: /etc/backup/lin-excludes.txt
+#    paths:
+#      - path: /var/lib/mysql
+#        pre_script: mysql-stop
+#        pre_script_local: mysql-dump
+#        post_script: mysql-start
+#      - path: /var/backup/mysql-dump.sql
+#        # This backs up the dump created by the pre_script_local
+#      - path: /etc/mysql

@@ -3,14 +3,36 @@
 # https://github.com/vincetse/shellutils/blob/master/job_pool.sh
 
 . job_pool.sh
-. /etc/backup/options
+#. /etc/backup/options
 
-# Configuration file path
-CONFIG_FILE="/etc/backup/backup.yaml"
+# Function to find configuration file in search paths
+find_config_file() {
+    local filename="$1"
+    local search_paths=(
+        "./${filename}"
+        "/etc/backup/${filename}"
+    )
+    
+    for path in "${search_paths[@]}"; do
+        if [[ -f "$path" ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    
+    # Return the /etc/backup path as default if none found
+    echo "/etc/backup/${filename}"
+}
+
+# Configuration file paths with search order
+CONFIG_FILE=$(find_config_file "backup.yaml")
 SCRIPTS_DIR="/etc/backup/scripts"
 
 # Global dry-run flag
 DRY_RUN=false
+
+# Default rsync options
+rsyncOptions="-avz --stats --human-readable --progress --delete"
 
 # Color definitions
 RED='\033[0;31m'
@@ -62,6 +84,78 @@ execute_command() {
     fi
 }
 
+# Function to interpret rsync exit codes
+interpret_rsync_exit_code() {
+    local exit_code="$1"
+    local operation="$2"
+    
+    case $exit_code in
+        0)
+            echo "success"
+            ;;
+        1)
+            echo "warning" # Syntax or usage error
+            ;;
+        2)
+            echo "warning" # Protocol incompatibility
+            ;;
+        3)
+            echo "warning" # Errors selecting input/output files, dirs
+            ;;
+        4)
+            echo "failed"  # Requested action not supported
+            ;;
+        5)
+            echo "failed"  # Error starting client-server protocol
+            ;;
+        6)
+            echo "failed"  # Daemon unable to append to log-file
+            ;;
+        10)
+            echo "failed"  # Error in socket I/O
+            ;;
+        11)
+            echo "failed"  # Error in file I/O
+            ;;
+        12)
+            echo "failed"  # Error in rsync protocol data stream
+            ;;
+        13)
+            echo "failed"  # Errors with program diagnostics
+            ;;
+        14)
+            echo "failed"  # Error in IPC code
+            ;;
+        20)
+            echo "failed"  # Received SIGUSR1 or SIGINT
+            ;;
+        21)
+            echo "failed"  # Some error returned by waitpid()
+            ;;
+        22)
+            echo "failed"  # Error allocating core memory buffers
+            ;;
+        23)
+            echo "warning" # Partial transfer due to error
+            ;;
+        24)
+            echo "warning" # Partial transfer due to vanished source files
+            ;;
+        25)
+            echo "failed"  # The --max-delete limit stopped deletions
+            ;;
+        30)
+            echo "failed"  # Timeout in data send/receive
+            ;;
+        35)
+            echo "failed"  # Timeout waiting for daemon connection
+            ;;
+        *)
+            echo "failed"  # Unknown exit code
+            ;;
+    esac
+}
+
 function ctrl_c(){
     print_warning "Exiting on Ctrl-C..."
     backup_exit
@@ -69,9 +163,36 @@ function ctrl_c(){
 
 function backup_exit(){
     job_pool_shutdown
-    rm "$lock_file" 2>/dev/null
+    local cleanup_lock_file=$(get_config_value "lock_file" "/tmp/backup.fil")
+    rm "$cleanup_lock_file" 2>/dev/null
     print_info "Backup script exited cleanly"
     exit
+}
+
+function check_lock_file(){
+    local lock_file="$1"
+    
+    if [[ ! -f "$lock_file" ]]; then
+        return 0  # No lock file, safe to proceed
+    fi
+    
+    local lock_pid
+    lock_pid=$(cat "$lock_file" 2>/dev/null)
+    
+    if [[ -z "$lock_pid" || ! "$lock_pid" =~ ^[0-9]+$ ]]; then
+        print_warning "Lock file exists but contains invalid PID, removing stale lock"
+        rm "$lock_file" 2>/dev/null
+        return 0
+    fi
+    
+    if kill -0 "$lock_pid" 2>/dev/null; then
+        print_warning "Backup already running (PID: $lock_pid), skipping for now"
+        return 1
+    else
+        print_warning "Lock file exists but process $lock_pid is not running, removing stale lock"
+        rm "$lock_file" 2>/dev/null
+        return 0
+    fi
 }
 
 function check_dependencies() {
@@ -237,12 +358,16 @@ function backup_host() {
     
     print_header "Starting backup for $hostname"
     
+    # Initialize host-level backup status
+    BACKUP_STATUS_HOST="success"
+    
     # Get host-level configuration
-    local ssh_key=$(get_host_config "$hostname" "ssh_key" "/home/pjakobs/.ssh/id_ed25519")
-    local ssh_user_raw=$(get_host_config "$hostname" "ssh_user" "pjakobs")
+    local ssh_key=$(get_host_config "$hostname" "ssh_key" "~/.ssh/id_ed25519")
+    local ssh_user_raw=$(get_host_config "$hostname" "ssh_user" "")
     local target_hostname=$(get_host_config "$hostname" "hostname" "$hostname")
     local exclude_file=$(get_host_config "$hostname" "exclude_file" "")
     local default_rsync_path=$(get_host_config "$hostname" "rsync_path" "")
+    local preserve_ownership=$(get_host_config "$hostname" "preserve_ownership" "false")
     
     # Handle both formats: combined "user@host" or separate fields  
     local ssh_user
@@ -277,6 +402,9 @@ function backup_host() {
         [[ -z "$path" || "$path" == "null" ]] && continue
         
         print_info "Processing path: $path"
+        
+        # Initialize volume-level backup status
+        BACKUP_STATUS_VOLUME="success"
         
         # Get path-specific configuration
         local dest_subdir=$(get_path_config "$hostname" "$i" "dest_subdir" "")
@@ -317,15 +445,25 @@ function backup_host() {
             source_path="$path"
         fi
         
-        # Build rsync command
-        local rsync_cmd="rsync $rsyncOptions"
+        # Build rsync command with improved permission handling
+        local rsync_cmd="/usr/bin/rsync $rsyncOptions"
+        
+        # Add ownership handling options based on configuration
+        if [[ "$preserve_ownership" == "false" ]]; then
+            # Map all files to root ownership and fix permissions
+            rsync_cmd="$rsync_cmd --no-owner --no-group --chmod=D755,F644"
+        else
+            # Preserve original ownership but ensure we can write to directories
+            rsync_cmd="$rsync_cmd --chmod=Du+w"
+        fi
         
         if [[ -n "$path_rsync_path" && "$path_rsync_path" != "null" ]]; then
-            rsync_cmd="$rsync_cmd --rsync-path '$path_rsync_path'"
+            rsync_cmd="$rsync_cmd --rsync-path \"$path_rsync_path\""
         fi
         
         if [[ -n "$ssh_key" && "$ssh_key" != "null" && "$ssh_key" != '""' && -n "$ssh_user" ]]; then
-            rsync_cmd="$rsync_cmd -e 'ssh -i $ssh_key'"
+            # Add SSH options to handle problematic shells (like fish)
+            rsync_cmd="$rsync_cmd -e \"ssh -i $ssh_key -o LogLevel=ERROR -o BatchMode=yes\""
         fi
         
         if [[ -n "$path_options" && "$path_options" != "null" ]]; then
@@ -340,9 +478,88 @@ function backup_host() {
         
         if [[ "$DRY_RUN" == "true" ]]; then
             print_dry_run "$rsync_cmd $source_path $dest_path"
+            BACKUP_STATUS_VOLUME="success"
         else
+            # Ensure backup directory is writable by root before rsync
+            if [[ -d "$dest_path" ]]; then
+                chmod -R u+w "$dest_path" 2>/dev/null || true
+            fi
+            
             print_command "$rsync_cmd $source_path $dest_path"
-            job_pool_run bash -c "$rsync_cmd $source_path $dest_path"
+            
+            # Capture rsync output and statistics
+            local rsync_output_file="/tmp/rsync_output_${hostname}_${i}_$$.log"
+            eval "$rsync_cmd $source_path $dest_path" 2>&1 | tee "$rsync_output_file"
+            local rsync_exit_code=${PIPESTATUS[0]}
+            
+            # Extract rsync statistics from output
+            local bytes_sent=$(grep "sent.*bytes" "$rsync_output_file" | sed -n 's/sent \([0-9.]*\) bytes.*/\1/p' | tr -d '.')
+            local bytes_received=$(grep "received.*bytes" "$rsync_output_file" | sed -n 's/.*received \([0-9.]*\) bytes.*/\1/p' | tr -d '.')
+            local transfer_rate=$(grep "bytes/sec" "$rsync_output_file" | sed -n 's/.*\([0-9.,]*\) bytes\/sec/\1/p' | tr -d ',.')
+            local total_size=$(grep "total size is" "$rsync_output_file" | sed -n 's/total size is \([0-9.]*\).*/\1/p' | tr -d '.')
+            local speedup=$(grep "speedup is" "$rsync_output_file" | sed -n 's/.*speedup is \([0-9.,]*\)/\1/p' | tr -d ',')
+            
+            # Extract detailed error information for better Grafana display
+            local error_count=$(grep -c "rsync:" "$rsync_output_file" || echo "0")
+            local warning_count=$(grep -c "warning\|partial transfer" "$rsync_output_file" || echo "0")
+            local permission_errors=$(grep -c "Permission denied" "$rsync_output_file" || echo "0")
+            local connection_errors=$(grep -c "connection\|timeout\|refused" "$rsync_output_file" || echo "0")
+            
+            # Extract first few error messages for detailed logging
+            local error_messages=""
+            if [[ $error_count -gt 0 ]]; then
+                error_messages=$(grep "rsync:" "$rsync_output_file" | head -3 | tr '\n' '; ' | sed 's/; $//')
+            fi
+            
+            # Log enhanced rsync statistics for metrics collection
+            echo "RSYNC_STATS: host=$hostname path=$path bytes_sent=$bytes_sent bytes_received=$bytes_received transfer_rate=$transfer_rate total_size=$total_size speedup=$speedup exit_code=$rsync_exit_code error_count=$error_count warning_count=$warning_count permission_errors=$permission_errors connection_errors=$connection_errors timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >> /var/log/backup-stats.log
+            
+            # Log detailed error messages if any exist
+            if [[ -n "$error_messages" ]]; then
+                echo "RSYNC_ERRORS: host=$hostname path=$path messages=\"$error_messages\" timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >> /var/log/backup-stats.log
+            fi
+            
+            # Clean up temporary file
+            rm -f "$rsync_output_file" 2>/dev/null
+            
+            # Fix permissions after rsync if preserve_ownership is false
+            if [[ "$preserve_ownership" == "false" ]]; then
+                print_info "Fixing ownership and permissions for backup files..."
+                chown -R root:root "$dest_path" 2>/dev/null || true
+                find "$dest_path" -type d -exec chmod 755 {} \; 2>/dev/null || true
+                find "$dest_path" -type f -exec chmod 644 {} \; 2>/dev/null || true
+            else
+                # Just ensure directories are writable for future backups
+                find "$dest_path" -type d -exec chmod u+w {} \; 2>/dev/null || true
+            fi
+            
+            # Interpret rsync exit code
+            BACKUP_STATUS_VOLUME=$(interpret_rsync_exit_code $rsync_exit_code "backup")
+            
+            # Log rsync result with proper exit code interpretation
+            case "$BACKUP_STATUS_VOLUME" in
+                "success")
+                    print_success "Volume backup completed successfully: $hostname:$path"
+                    ;;
+                "warning")
+                    print_warning "Volume backup completed with warnings: $hostname:$path (exit code: $rsync_exit_code)"
+                    # Log specific error for metrics collection
+                    if [[ $error_count -gt 0 ]]; then
+                        echo "BACKUP_ERROR: host=$hostname path=$path error_count=$error_count exit_code=$rsync_exit_code timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
+                    fi
+                    # Don't fail the host for warnings, but track it
+                    if [[ "$BACKUP_STATUS_HOST" == "success" ]]; then
+                        BACKUP_STATUS_HOST="warning"
+                    fi
+                    ;;
+                "failed")
+                    print_error "Volume backup failed: $hostname:$path (exit code: $rsync_exit_code)"
+                    # Log specific error for metrics collection
+                    echo "BACKUP_ERROR: host=$hostname path=$path error_count=$error_count exit_code=$rsync_exit_code timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
+                    BACKUP_STATUS_HOST="failed"
+                    BACKUP_STATUS_OVERALL="failed"
+                    ;;
+            esac
         fi
         
         # Run local post-script
@@ -355,6 +572,20 @@ function backup_host() {
             run_script "$post_script" "$ssh_user" "$ssh_key" "remote"
         fi
     done
+    
+    # Log final host backup status
+    if [[ "$BACKUP_STATUS_HOST" == "success" ]]; then
+        print_success "Host backup completed successfully: $hostname"
+    elif [[ "$BACKUP_STATUS_HOST" == "warning" ]]; then
+        print_warning "Host backup completed with warnings: $hostname"
+        # Track overall warning status
+        if [[ "$BACKUP_STATUS_OVERALL" == "success" ]]; then
+            BACKUP_STATUS_OVERALL="warning"
+        fi
+    else
+        print_error "Host backup failed: $hostname"
+        BACKUP_STATUS_OVERALL="failed"
+    fi
 }
 
 function verify_host_connectivity() {
@@ -512,8 +743,9 @@ function verify_all_hosts() {
         else
             failed_hosts+=("$hostname")
         fi
-        echo  # Add spacing between hosts
     done
+    print_info "Verification complete. Working hosts: ${working_hosts[*]}"
+    print_info "Failed hosts: ${failed_hosts[*]}"
     
     if [[ ${#failed_hosts[@]} -gt 0 ]]; then
         if [[ "$DRY_RUN" == "true" ]]; then
@@ -530,10 +762,7 @@ function verify_all_hosts() {
                 return 1
             fi
         fi
-    else
-        print_success "All hosts verified successfully"
     fi
-    return 0
 }
 
 function create_snapshots() {
@@ -544,7 +773,7 @@ function create_snapshots() {
     
     if [[ "$schedules_count" == "0" || "$schedules_count" == "null" ]]; then
         print_warning "No snapshot schedules configured, using defaults..."
-        # Use original hardcoded values as fallback
+        # Use original values as fallback
         execute_command "sudo /usr/local/sbin/btrfs-snp /share hourly 6 14400"
         execute_command "sudo /usr/local/sbin/btrfs-snp /share daily 7 86400"
         execute_command "sudo /usr/local/sbin/btrfs-snp /share weekly 4 604800"
@@ -563,11 +792,11 @@ function create_snapshots() {
         if [[ "$type" != "null" && "$count" != "null" && "$interval" != "null" ]]; then
             print_info "Creating $type snapshots: $count snapshots, $interval second intervals"
             execute_command "sudo /usr/local/sbin/btrfs-snp \"$snapshot_volume\" \"$type\" \"$count\" \"$interval\""
+        else
+            print_warning "Skipping snapshot schedule $i due to missing configuration"
         fi
     done
 }
-
-print_info "Using rsync options: $rsyncOptions"
 
 trap ctrl_c INT
 
@@ -595,8 +824,7 @@ run_backup() {
     
     if [[ "$dry_run_mode" == "true" ]]; then
         DRY_RUN=true
-        print_header "Backup Script - DRY RUN MODE"
-        print_warning "This is a dry run - no commands will be executed"
+        print_dry_run "backup would be executed without making changes"
         echo
     else
         DRY_RUN=false
@@ -607,24 +835,26 @@ run_backup() {
     
     check_dependencies
     
+    # Initialize overall backup status
+    BACKUP_STATUS_OVERALL="success"
+    
     # Load configuration
     backup_base=$(get_config_value "backup_base" "/share/backup/")
     lock_file=$(get_config_value "lock_file" "/tmp/backup.fil")
-    rsync_options=$(get_config_value "rsync_options" "$rsyncOptions")
+    rsyncOptions=$(get_config_value "rsync_options" "$rsyncOptions")
     
-    print_info "Using rsync options: $rsync_options"
+    print_info "Using rsync options: $rsyncOptions"
     
-    # Create snapshots from configuration
-    create_snapshots
-    
+    # Handle lock file and create snapshots
     if [[ "$dry_run_mode" == "true" ]]; then
-        print_dry_run "touch \"$lock_file\""
+        print_dry_run "echo \$\$ > \"$lock_file\""
+        print_dry_run "create_snapshots"
     else
-        if [[ -f "$lock_file" ]]; then
-            print_warning "Backup already running, skipping for now"
+        if ! check_lock_file "$lock_file"; then
             exit 1
         fi
-        execute_command "touch \"$lock_file\""
+        execute_command "echo \$\$ > \"$lock_file\""
+        create_snapshots
     fi
     
     # Parse configuration
@@ -643,12 +873,12 @@ run_backup() {
     
     if [[ "$dry_run_mode" == "true" ]]; then
         print_header "Starting Backup Operations (DRY RUN)"
-        print_dry_run "job_pool_init $(nproc) 0"
+        #print_dry_run "job_pool_init $(nproc) 0"
         print_info "Would initialize job pool with $(nproc) parallel jobs"
     else
         print_header "Starting Backup Operations"
         print_info "Initializing job pool with $(nproc) parallel jobs"
-        job_pool_init $(nproc) 0 # use number of system installed cores as max job number
+        #job_pool_init $(nproc) 0 # use number of system installed cores as max job number
     fi
     
     # Backup each host
@@ -657,14 +887,23 @@ run_backup() {
     done
     
     if [[ "$dry_run_mode" == "true" ]]; then
-        print_dry_run "job_pool_shutdown"
+        #print_dry_run "job_pool_shutdown"
         print_info "Would shutdown job pool"
         print_dry_run "rm \"$lock_file\""
         print_success "Dry run completed successfully"
     else
-        job_pool_shutdown
+        #job_pool_shutdown
         execute_command "rm \"$lock_file\""
-        print_success "Backup operations completed successfully"
+        
+        # Report final backup status
+        if [[ "$BACKUP_STATUS_OVERALL" == "success" ]]; then
+            print_success "Backup operations completed successfully"
+        elif [[ "$BACKUP_STATUS_OVERALL" == "warning" ]]; then
+            print_warning "Backup operations completed with warnings"
+        else
+            print_error "Backup operations completed with failures"
+            exit 1
+        fi
     fi
 }
 

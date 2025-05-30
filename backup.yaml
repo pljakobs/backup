@@ -2,7 +2,7 @@
 config:
   backup_base: "/share/backup/"
   lock_file: "/tmp/backup.fil"
-  rsync_options: "-avz --delete"
+  rsync_options: "-avz --delete-after --ignore-errors"
   
 snapshots:
   volume: "/share"
@@ -39,6 +39,7 @@ hosts:
     hostname: labpc
     ssh_user: pjakobs
     ssh_key: /home/pjakobs/.ssh/id_ed25519
+    ignore_ping: true  # Host doesn't respond to ping but allows SSH
     exclude_file: /etc/backup/lin-excludes.txt
     paths:
       - path: /etc
@@ -84,6 +85,7 @@ hosts:
     hostname: ThinkPad
     ssh_user: pjakobs
     ssh_key: /home/pjakobs/.ssh/id_ed25519
+    ignore_ping: true  # Host doesn't respond to ping but allows SSH
     rsync_path: sudo rsync
     exclude_file: /etc/backup/lin-excludes.txt
     paths:
@@ -112,6 +114,7 @@ hosts:
     hostname: lightinator.de
     ssh_user: pjakobs
     ssh_key: /home/pjakobs/.ssh/id_ed25519
+    ignore_ping: true  # External host that may not respond to ping
     rsync_path: sudo rsync
     exclude_file: /etc/backup/lin-excludes.txt
     paths:
@@ -134,6 +137,7 @@ hosts:
 #    hostname: db.example.com
 #    ssh_user: dbadmin
 #    ssh_key: /home/pjakobs/.ssh/id_ed25519
+#    ignore_ping: false  # Set to true for hosts that don't respond to ping
 #    rsync_path: sudo rsync
 #    exclude_file: /etc/backup/lin-excludes.txt
 #    paths:

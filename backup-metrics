@@ -1,0 +1,2149 @@
+#!/usr/bin/env python3
+"""
+Enhanced Backup Metrics Collector with systemd log parsing and InfluxDB integration
+"""
+
+import json
+import subprocess
+import sys
+import time
+import threading
+import queue
+import signal
+import yaml
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional
+import re
+
+class BackupMetricsCollector:
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        
+        # Set default config file paths with search order
+        self.config_file = self._find_config_file("backup.yaml")
+        self.influxdb_config_file = self._find_config_file("influxdb-config.yaml")
+            
+        self.metrics = []
+        self.load_config()
+        self.load_influxdb_config()
+        
+        # Thread management
+        self.du_thread = None
+        self.du_results = {}
+        self.du_queue = queue.Queue()
+        self.du_completed = threading.Event()
+        
+    def _find_config_file(self, filename: str) -> str:
+        """Find configuration file in search paths: ./ then /etc/backup/"""
+        search_paths = [
+            f"./{filename}",
+            f"/etc/backup/{filename}"
+        ]
+        
+        for path in search_paths:
+            if Path(path).exists():
+                return path
+        
+        # Return the /etc/backup path as default if none found
+        return f"/etc/backup/{filename}"
+    
+    def load_config(self):
+        """Load backup configuration to get list of hosts"""
+        try:
+            with open(self.config_file, 'r') as f:
+                self.config = yaml.safe_load(f)
+            self.hosts = list(self.config.get('hosts', {}).keys())
+            print(f"Loaded backup config from: {self.config_file}")
+        except Exception as e:
+            print(f"Warning: Could not load config {self.config_file}: {e}")
+            self.config = {}
+            self.hosts = []
+    
+    def load_influxdb_config(self):
+        """Load InfluxDB configuration"""
+        try:
+            with open(self.influxdb_config_file, 'r') as f:
+                self.influxdb_config = yaml.safe_load(f)
+            print(f"Loaded InfluxDB config from: {self.influxdb_config_file}")
+            
+        except Exception as e:
+            print(f"Warning: Could not load InfluxDB config {self.influxdb_config_file}: {e}")
+            # Set default values
+            self.influxdb_config = {
+                'influxdb': {
+                    'host': 'localhost',
+                    'port': 8086,
+                    'database': 'backup_metrics',
+                    'username': '',
+                    'password': '',
+                    'ssl': False,
+                    'organization': '',
+                    'bucket': '',
+                    'token': ''
+                }
+            }
+
+    def _directory_scanner_worker(self, host_dirs: List[Path], backup_base: str):
+        """Background worker thread for scanning directories - uses btrfs filesystem du when available"""
+        print(f"Starting background directory scan for {len(host_dirs)} directories...")
+        
+        # Check if we're on a btrfs filesystem
+        btrfs_available = self._is_btrfs_filesystem(backup_base) and self._command_exists("btrfs")
+        if btrfs_available:
+            print("Using btrfs filesystem du for improved performance")
+        else:
+            print("Using standard du command")
+        
+        for i, host_dir in enumerate(host_dirs):
+            hostname = host_dir.name
+            print(f"Background scan {i+1}/{len(host_dirs)}: {hostname}...", end=" ", flush=True)
+            
+            try:
+                start_time = time.time()
+                
+                if btrfs_available:
+                    # Use btrfs filesystem du for better performance on btrfs
+                    # Add --raw flag for raw byte output to avoid parsing issues
+                    du_cmd = ["btrfs", "filesystem", "du", "--raw", "-s", str(host_dir)]
+                else:
+                    # Fallback to regular du with ionice if available
+                    du_cmd = ["ionice", "-c", "3", "du", "-sb", str(host_dir)]
+                    if not self._command_exists("ionice"):
+                        du_cmd = ["du", "-sb", str(host_dir)]
+                
+                # Reduce timeout for very slow operations
+                timeout_duration = 1800 if btrfs_available else 3600  # 30min for btrfs, 1hr for du
+                
+                result = subprocess.run(
+                    du_cmd,
+                    capture_output=True, text=True, check=True,
+                    timeout=timeout_duration
+                )
+                
+                if btrfs_available:
+                    # Parse btrfs filesystem du --raw output
+                    # Format with --raw: "Total: 1234567890 bytes"
+                    size_bytes = self._parse_btrfs_du_output(result.stdout, str(host_dir))
+                else:
+                    # Regular du output
+                    size_bytes = int(result.stdout.split()[0])
+                
+                scan_duration = time.time() - start_time
+                
+                # Skip file count for very large directories to improve performance
+                if scan_duration > 60:  # If du took more than 1 minute, skip file count
+                    file_count = 0
+                    print("(skipping file count for performance)", end=" ")
+                else:
+                    # Quick file count with limited depth to avoid hanging
+                    find_cmd = ["find", str(host_dir), "-maxdepth", "2", "-type", "f"]
+                    try:
+                        find_result = subprocess.run(
+                            find_cmd,
+                            capture_output=True, text=True, check=True, 
+                            timeout=300  # 5 minute timeout for file count
+                        )
+                        file_count = len(find_result.stdout.strip().split('\n')) if find_result.stdout.strip() else 0
+                    except subprocess.TimeoutExpired:
+                        file_count = 0
+                        print("(file count timeout)", end=" ")
+                
+                last_modified = host_dir.stat().st_mtime
+                
+                stats = {
+                    'size_bytes': size_bytes,
+                    'file_count': file_count,
+                    'last_modified': datetime.fromtimestamp(last_modified),
+                    'path': str(host_dir),
+                    'scan_duration': scan_duration,
+                    'scan_method': 'btrfs' if btrfs_available else 'du'
+                }
+                
+                self.du_queue.put((hostname, stats))
+                print(f"✓ ({size_bytes / 1024**3:.1f}GB in {scan_duration:.1f}s)")
+                
+                # Send individual host update to InfluxDB immediately
+                self._send_host_metrics_to_influxdb(hostname, stats)
+                
+            except subprocess.CalledProcessError as e:
+                print(f"⚠ (error: {e})")
+                # If btrfs fails, try fallback to regular du
+                if btrfs_available:
+                    print(f"  Retrying {hostname} with regular du...", end=" ")
+                    try:
+                        fallback_cmd = ["du", "-sb", str(host_dir)]
+                        fallback_result = subprocess.run(
+                            fallback_cmd,
+                            capture_output=True, text=True, check=True,
+                            timeout=600  # 10 minute timeout for fallback
+                        )
+                        size_bytes = int(fallback_result.stdout.split()[0])
+                        scan_duration = time.time() - start_time
+                        
+                        fallback_stats = {
+                            'size_bytes': size_bytes,
+                            'file_count': 0,
+                            'last_modified': datetime.fromtimestamp(host_dir.stat().st_mtime),
+                            'path': str(host_dir),
+                            'scan_duration': scan_duration,
+                            'scan_method': 'du_fallback'
+                        }
+                        self.du_queue.put((hostname, fallback_stats))
+                        print(f"✓ fallback ({size_bytes / 1024**3:.1f}GB)")
+                        continue
+                    except:
+                        pass
+                
+                # Use basic file stats as final fallback
+                try:
+                    stat = host_dir.stat()
+                    fallback_stats = {
+                        'size_bytes': stat.st_size,
+                        'file_count': 0,
+                        'last_modified': datetime.fromtimestamp(stat.st_mtime),
+                        'path': str(host_dir),
+                        'scan_duration': 0,
+                        'scan_method': 'fallback'
+                    }
+                    self.du_queue.put((hostname, fallback_stats))
+                except:
+                    pass
+            except subprocess.TimeoutExpired:
+                timeout_min = timeout_duration // 60
+                print(f"⚠ (timeout after {timeout_min} minutes)")
+                # Use basic file stats as fallback for timeout
+                try:
+                    stat = host_dir.stat()
+                    fallback_stats = {
+                        'size_bytes': stat.st_size,
+                        'file_count': 0,
+                        'last_modified': datetime.fromtimestamp(stat.st_mtime),
+                        'path': str(host_dir),
+                        'scan_duration': 0,
+                        'scan_method': 'timeout_fallback'
+                    }
+                    self.du_queue.put((hostname, fallback_stats))
+                except:
+                    pass
+        
+        print("Background directory scan completed!")
+        self.du_completed.set()
+
+    def _command_exists(self, command: str) -> bool:
+        """Check if a command exists on the system"""
+        try:
+            subprocess.run(["which", command], check=True, capture_output=True)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+    
+    def _is_btrfs_filesystem(self, path: str) -> bool:
+        """Check if a path is on a btrfs filesystem"""
+        try:
+            result = subprocess.run(
+                ["df", "-T", path], 
+                capture_output=True, text=True, check=True
+            )
+            return "btrfs" in result.stdout
+        except subprocess.CalledProcessError:
+            return False
+    
+    def parse_rsync_statistics(self, hours: int = 24) -> Dict:
+        """Parse rsync statistics from backup logs"""
+        logs = self.parse_systemd_logs(hours=hours)
+        rsync_stats = {}
+        
+        # Track current host/path context
+        current_host = None
+        current_path = None
+        
+        for log in logs:
+            message = log.get('MESSAGE', '')
+            
+            # Check for host context
+            host_match = re.search(r'=== Starting backup for (\w+)', message)
+            if host_match:
+                current_host = host_match.group(1)
+                if current_host not in rsync_stats:
+                    rsync_stats[current_host] = {}
+            
+            # Check for path context
+            path_match = re.search(r'Volume backup .+?: \w+:([^\s\(]+)', message)
+            if path_match:
+                current_path = path_match.group(1).strip()
+                if current_host and current_path and current_path not in rsync_stats.get(current_host, {}):
+                    rsync_stats.setdefault(current_host, {})[current_path] = {
+                        'bytes_sent': 0,
+                        'bytes_received': 0,
+                        'transfer_rate': 0,
+                        'total_size': 0,
+                        'speedup': 1.0  # Default speedup
+                    }
+            
+            # Look for rsync summary statistics
+            # Pattern like: "sent 1,234,567 bytes  received 890 bytes  123,456.78 bytes/sec"
+            rsync_match = re.search(
+                r'sent ([\d,\.]+) bytes\s+received ([\d,\.]+) bytes\s+([\d,\.]+) bytes/sec', 
+                message
+            )
+            if rsync_match and current_host and current_path:
+                # Convert European number format (1.234,56) to standard format for parsing
+                bytes_sent_str = rsync_match.group(1).replace('.', '').replace(',', '.')
+                bytes_received_str = rsync_match.group(2).replace('.', '').replace(',', '.')
+                transfer_rate_str = rsync_match.group(3).replace('.', '').replace(',', '.')
+                
+                try:
+                    bytes_sent = int(float(bytes_sent_str))
+                    bytes_received = int(float(bytes_received_str))
+                    transfer_rate = float(transfer_rate_str)
+                    
+                    if current_host not in rsync_stats:
+                        rsync_stats[current_host] = {}
+                    
+                    if current_path not in rsync_stats[current_host]:
+                        rsync_stats[current_host][current_path] = {}
+                    
+                    rsync_stats[current_host][current_path].update({
+                        'bytes_sent': bytes_sent,
+                        'bytes_received': bytes_received,
+                        'transfer_rate': transfer_rate,
+                        'total_size': bytes_sent + bytes_received,
+                    })
+                    
+                    if self.verbose:
+                        print(f"Found rsync stats for {current_host}:{current_path} - sent: {bytes_sent}, received: {bytes_received}, rate: {transfer_rate}")
+                        
+                except (ValueError, TypeError) as e:
+                    if self.verbose:
+                        print(f"Error parsing rsync numbers: {e} - {bytes_sent_str}, {bytes_received_str}, {transfer_rate_str}")
+            
+            # Look for speedup information
+            speedup_match = re.search(r'total size is ([\d,\.]+)\s+speedup is ([\d,\.]+)', message)
+            if speedup_match and current_host and current_path:
+                # Convert European number format (1.234,56) to standard format for parsing
+                total_size_str = speedup_match.group(1).replace('.', '').replace(',', '.')
+                speedup_str = speedup_match.group(2).replace('.', '').replace(',', '.')
+                
+                try:
+                    total_size = int(float(total_size_str))
+                    speedup = float(speedup_str)
+                    
+                    if current_host not in rsync_stats:
+                        rsync_stats[current_host] = {}
+                    
+                    if current_path not in rsync_stats[current_host]:
+                        rsync_stats[current_host][current_path] = {}
+                    
+                    rsync_stats[current_host][current_path].update({
+                        'total_size': total_size,
+                        'speedup': speedup
+                    })
+                    
+                    if self.verbose:
+                        print(f"Found speedup stats for {current_host}:{current_path} - total size: {total_size}, speedup: {speedup}")
+                        
+                except (ValueError, TypeError) as e:
+                    if self.verbose:
+                        print(f"Error parsing speedup numbers: {e} - {total_size_str}, {speedup_str}")
+                
+        return rsync_stats
+
+    def _send_host_metrics_to_influxdb(self, hostname: str, stats: Dict):
+        """Send individual host metrics to InfluxDB immediately"""
+        try:
+            import requests
+        except ImportError:
+            return False
+        
+        influx_cfg = self.influxdb_config.get('influxdb', {})
+        host = influx_cfg.get('host', 'localhost')
+        port = influx_cfg.get('port', 8086)
+        ssl = influx_cfg.get('ssl', False)
+        
+        # InfluxDB version detection
+        token = influx_cfg.get('token', '')
+        organization = influx_cfg.get('organization', '')
+        is_influxdb_2x = bool(token and organization)
+        
+        timestamp_ns = int(time.time() * 1_000_000_000)
+        
+        # Create metrics line for this host
+        line = f'backup_host_size,host={hostname} size_bytes={stats["size_bytes"]}i,file_count={stats["file_count"]}i,scan_duration={stats["scan_duration"]} {timestamp_ns}'
+        
+        protocol = "https" if ssl else "http"
+        
+        try:
+            if is_influxdb_2x:
+                url = f"{protocol}://{host}:{port}/api/v2/write"
+                headers = {
+                    'Authorization': f'Token {token}',
+                    'Content-Type': 'text/plain; charset=utf-8'
+                }
+                params = {
+                    'org': organization,
+                    'bucket': influx_cfg.get('bucket', ''),
+                    'precision': 'ns'
+                }
+            else:
+                url = f"{protocol}://{host}:{port}/write"
+                headers = {'Content-Type': 'application/octet-stream'}
+                params = {"db": influx_cfg.get('database', 'backup_metrics')}
+                username = influx_cfg.get('username', '')
+                password = influx_cfg.get('password', '')
+                if username and password:
+                    params["u"] = username
+                    params["p"] = password
+            
+            response = requests.post(url, params=params, data=line, headers=headers, timeout=10)
+            if response.status_code == 204:
+                print(f"  → Updated InfluxDB with {hostname} metrics")
+            
+        except Exception as e:
+            print(f"  → InfluxDB update failed for {hostname}: {e}")
+
+    def parse_systemd_logs(self, service_name: str = "backup.service", hours: int = 24) -> List[Dict]:
+        """Parse systemd journal logs for backup service with timeout"""
+        print(f"Querying systemd logs for {service_name} (last {hours} hours)...", end=" ", flush=True)
+        
+        since = datetime.now() - timedelta(hours=hours)
+        since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+        
+        try:
+            cmd = [
+                "journalctl", 
+                "-u", service_name,
+                "--since", since_str,
+                "--output", "json",
+                "--no-pager"
+            ]
+            
+            if self.verbose:
+                print(f"\n  Running: {' '.join(cmd)}")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+                
+            logs = []
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    try:
+                        log_entry = json.loads(line)
+                        # Handle ANSI escape sequences in MESSAGE field
+                        message = log_entry.get('MESSAGE', '')
+                        if isinstance(message, list):
+                            # Convert byte array to string and remove ANSI codes
+                            try:
+                                message = ''.join(chr(b) for b in message if isinstance(b, int) and 0 <= b <= 127)
+                                # Remove ANSI escape sequences
+                                import re
+                                message = re.sub(r'\x1b\[[0-9;]*m', '', message)
+                                log_entry['MESSAGE'] = message
+                            except (ValueError, TypeError):
+                                log_entry['MESSAGE'] = str(message)
+                        logs.append(log_entry)
+                    except json.JSONDecodeError:
+                        if self.verbose:
+                            print(f"  Warning: Failed to parse JSON line: {line[:100]}...")
+                        continue
+            
+            print(f"✓ ({len(logs)} entries)")
+            
+            if self.verbose and logs:
+                print(f"  Sample log messages:")
+                for i, log in enumerate(logs[:5]):  # Show first 5 messages
+                    message = log.get('MESSAGE', '')
+                    timestamp = log.get('__REALTIME_TIMESTAMP', '')
+                    print(f"    {i+1}: {message[:80]}{'...' if len(message) > 80 else ''}")
+            
+            return logs
+                
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            print(f"⚠ (timeout/error: {e})")
+            return []
+    
+    def extract_backup_sessions(self, logs: List[Dict]) -> List[Dict]:
+        """Extract backup session information from logs with enhanced status detection"""
+        sessions = []
+        current_session = None
+        
+        # Debug counters
+        session_start_matches = 0
+        session_end_matches = 0
+        host_start_matches = 0
+        volume_matches = 0
+        
+        if self.verbose:
+            print(f"[DEBUG] Starting to extract sessions from {len(logs)} log entries")
+        
+        for i, log in enumerate(logs):
+            raw_message = log.get('MESSAGE', '')
+            timestamp = log.get('__REALTIME_TIMESTAMP', '')
+            
+            # Handle ANSI escape sequences in MESSAGE field
+            if isinstance(raw_message, list):
+                # Convert byte array to string
+                try:
+                    message = bytes(raw_message).decode('utf-8', errors='ignore')
+                    # Remove ANSI escape sequences
+                    message = re.sub(r'\x1b\[[0-9;]*m', '', message)
+                except (ValueError, TypeError):
+                    message = str(raw_message)
+            else:
+                message = str(raw_message)
+                # Remove ANSI escape sequences from string messages too
+                message = re.sub(r'\x1b\[[0-9;]*m', '', message)
+            
+            # Convert timestamp to datetime
+            if timestamp:
+                ts = datetime.fromtimestamp(int(timestamp) / 1000000)
+            else:
+                continue
+            
+            # Debug: Show first few messages to understand format
+            if self.verbose and i < 10:
+                print(f"[DEBUG] Raw message {i}: {raw_message}")
+                print(f"[DEBUG] Processed message {i}: {message[:100]}...")
+            
+            # Start of backup session
+            if "backup script - live mode" in message.lower():
+                session_start_matches += 1
+                if self.verbose:
+                    print(f"[DEBUG] Found session start: {message}")
+                current_session = {
+                    'start_time': ts,
+                    'status': 'running',
+                    'hosts': {},
+                    'errors': [],
+                    'warnings': [],
+                    'total_files': 0,
+                    'total_bytes': 0
+                }
+            
+            # Also check for alternative session start patterns
+            elif "starting backup operations" in message.lower():
+                session_start_matches += 1
+                if self.verbose:
+                    print(f"[DEBUG] Found alternative session start: {message}")
+                current_session = {
+                    'start_time': ts,
+                    'status': 'running',
+                    'hosts': {},
+                    'errors': [],
+                    'warnings': [],
+                    'total_files': 0,
+                    'total_bytes': 0
+                }
+            
+            # End of backup session - check for different completion states
+            elif current_session and ("Backup operations completed" in message or "✓ Backup operations completed" in message or "⚠ Backup operations completed" in message):
+                session_end_matches += 1
+                if self.verbose:
+                    print(f"[DEBUG] Found session end: {message}")
+                current_session['end_time'] = ts
+                current_session['duration'] = (ts - current_session['start_time']).total_seconds()
+                
+                if "✓" in message or "completed successfully" in message:
+                    current_session['status'] = 'success'
+                elif "⚠" in message or "completed with warnings" in message:
+                    current_session['status'] = 'warning'
+                elif "completed with failures" in message:
+                    current_session['status'] = 'failed'
+                else:
+                    current_session['status'] = 'unknown'
+                
+                sessions.append(current_session)
+                current_session = None
+            
+            # Backup script exit (could be error or success)
+            elif "Backup script exited cleanly" in message and current_session:
+                session_end_matches += 1
+                if self.verbose:
+                    print(f"[DEBUG] Found script exit: {message}")
+                current_session['end_time'] = ts
+                if current_session['status'] == 'running':
+                    current_session['status'] = 'interrupted'
+                current_session['duration'] = (ts - current_session['start_time']).total_seconds()
+                sessions.append(current_session)
+                current_session = None
+            
+            # Host backup start
+            elif "=== Starting backup for" in message and current_session:
+                host_start_matches += 1
+                if self.verbose:
+                    print(f"[DEBUG] Found host start: {message}")
+                host_match = re.search(r'=== Starting backup for (\w+)', message)
+                if host_match:
+                    hostname = host_match.group(1)
+                    current_session['hosts'][hostname] = {
+                        'start_time': ts,
+                        'status': 'running',
+                        'paths': [],
+                        'errors': [],
+                        'warnings': []
+                    }
+            
+            # Enhanced host backup completion status - now handles success/warning/failed
+            elif current_session and ("Host backup completed" in message or "✓ Host backup completed" in message or "⚠ Host backup completed" in message):
+                if self.verbose:
+                    print(f"[DEBUG] Found host completion: {message}")
+                # Match patterns like:
+                # ✓ Host backup completed successfully: bigbox
+                # ⚠ Host backup completed with warnings: hostname
+                # Host backup failed: hostname
+                host_match = re.search(r'(?:✓|⚠|❌)?\s*Host backup completed (?:successfully|with warnings): (\w+)', message)
+                if not host_match:
+                    host_match = re.search(r'Host backup failed: (\w+)', message)
+                
+                if host_match:
+                    hostname = host_match.group(1)
+                    if hostname in current_session['hosts']:
+                        host_data = current_session['hosts'][hostname]
+                        host_data['end_time'] = ts
+                        
+                        if "✓" in message or "completed successfully" in message:
+                            host_data['status'] = 'success'
+                        elif "⚠" in message or "completed with warnings" in message:
+                            host_data['status'] = 'warning'
+                        elif "failed" in message:
+                            host_data['status'] = 'failed'
+            
+            # Enhanced volume backup status - now handles success/warning/failed with exit codes
+            elif current_session and ("Volume backup" in message or "✓ Volume backup" in message or "⚠ Volume backup" in message):
+                volume_matches += 1
+                if self.verbose:
+                    print(f"[DEBUG] Found volume backup: {message}")
+                # Match patterns like:
+                # ✓ Volume backup completed successfully: bigbox:/etc
+                # ⚠ Volume backup completed with warnings: T460:/home/pjakobs (exit code: 2)
+                # Volume backup failed: hostname:/path
+                volume_match = re.search(r'(?:✓|⚠|❌)?\s*Volume backup (?:completed successfully|completed with warnings|failed): (\w+):(.+?)(?:\s+\(exit code: (\d+)\))?$', message)
+                if volume_match:
+                    hostname = volume_match.group(1)
+                    path = volume_match.group(2).strip()
+                    exit_code = volume_match.group(3)
+                    
+                    if hostname in current_session['hosts']:
+                        host_data = current_session['hosts'][hostname]
+                        
+                        # Determine status from message
+                        if "✓" in message or "completed successfully" in message:
+                            status = 'success'
+                        elif "⚠" in message or "completed with warnings" in message:
+                            status = 'warning'
+                        else:
+                            status = 'failed'
+                        
+                        path_info = {
+                            'path': path,
+                            'timestamp': ts,
+                            'status': status
+                        }
+                        
+                        # Add exit code if present
+                        if exit_code:
+                            path_info['exit_code'] = int(exit_code)
+                        
+                        host_data['paths'].append(path_info)
+            
+            # Rsync errors detection
+            elif "rsync:" in message and ("error" in message.lower() or "failed" in message.lower()):
+                if current_session:
+                    error_info = {
+                        'timestamp': ts,
+                        'message': message,
+                        'type': 'rsync_error'
+                    }
+                    current_session['errors'].append(error_info)  # ← Errors added here
+                    
+                    # Also add to current host if available
+                    for hostname, host_data in current_session['hosts'].items():
+                        if host_data.get('status') == 'running':
+                            host_data['errors'].append(error_info)
+                            break
+            
+            # Warning messages
+            elif current_session and ("⚠" in message or "WARNING" in message.upper() or "completed with warnings" in message):
+                warning_info = {
+                    'timestamp': ts,
+                    'message': message,
+                    'type': 'warning'
+                }
+                current_session['warnings'].append(warning_info)
+        
+        # Handle incomplete sessions (still running or crashed)
+        if current_session:
+            current_session['end_time'] = datetime.now()
+            if current_session['errors']:
+                current_session['status'] = 'failed'
+            elif current_session['warnings']:
+                current_session['status'] = 'warning'
+            else:
+                current_session['status'] = 'running'
+            current_session['duration'] = (current_session['end_time'] - current_session['start_time']).total_seconds()
+            sessions.append(current_session)
+        
+        if self.verbose:
+            print(f"[DEBUG] Pattern matches found:")
+            print(f"  - Session starts: {session_start_matches}")
+            print(f"  - Session ends: {session_end_matches}")
+            print(f"  - Host starts: {host_start_matches}")
+            print(f"  - Volume backups: {volume_matches}")
+            print(f"[DEBUG] Extracted {len(sessions)} sessions")
+            
+            if len(sessions) == 0 and len(logs) > 0:
+                print(f"[DEBUG] No sessions found! Checking for common patterns in logs...")
+                # Look for common patterns that might be different
+                patterns = [
+                    "backup",
+                    "rsync",
+                    "Starting",
+                    "completed",
+                    "LIVE MODE",
+                    "===",
+                    "Host backup",
+                    "Volume backup"
+                ]
+                for pattern in patterns:
+                    count = sum(1 for log in logs if pattern.lower() in log.get('MESSAGE', '').lower())
+                    if count > 0:
+                        print(f"    '{pattern}': {count} matches")
+        
+        return sessions
+    
+    def get_backup_directory_stats_fast(self, backup_base: str = "/share/backup") -> Dict:
+        """Get quick filesystem statistics using cached data and basic stats"""
+        print(f"Getting quick backup directory stats from {backup_base}...")
+        stats = {}
+        backup_path = Path(backup_base)
+        
+        if not backup_path.exists():
+            print(f"Backup path {backup_base} does not exist")
+            return stats
+        
+        host_dirs = [d for d in backup_path.iterdir() if d.is_dir()]
+        print(f"Found {len(host_dirs)} host directories")
+        
+        # First, get any cached results from background scan
+        while not self.du_queue.empty():
+            try:
+                hostname, host_stats = self.du_queue.get_nowait()
+                self.du_results[hostname] = host_stats
+            except queue.Empty:
+                break
+        
+        # For directories we have cached data, use it
+        for hostname, cached_stats in self.du_results.items():
+            stats[hostname] = cached_stats
+        
+        # For directories we don't have cached data, use quick stats
+        for host_dir in host_dirs:
+            hostname = host_dir.name
+            if hostname not in stats:
+                try:
+                    stat = host_dir.stat()
+                    stats[hostname] = {
+                        'size_bytes': 0,  # Will be updated by background scan
+                        'file_count': 0,  # Will be updated by background scan
+                        'last_modified': datetime.fromtimestamp(stat.st_mtime),
+                        'path': str(host_dir),
+                        'scan_duration': 0
+                    }
+                    print(f"  {hostname}: using placeholder data (background scan pending)")
+                except:
+                    pass
+        
+        return stats
+
+    def start_background_directory_scan(self, backup_base: str = "/share/backup"):
+        """Start background thread to scan directory sizes"""
+        backup_path = Path(backup_base)
+        
+        if not backup_path.exists():
+            print(f"Backup path {backup_base} does not exist")
+            return
+        
+        host_dirs = [d for d in backup_path.iterdir() if d.is_dir()]
+        
+        # Only start scan if we don't have one running
+        if self.du_thread is None or not self.du_thread.is_alive():
+            self.du_completed.clear()
+            self.du_thread = threading.Thread(
+                target=self._directory_scanner_worker,
+                args=(host_dirs, backup_base),
+                daemon=True
+            )
+            self.du_thread.start()
+            print(f"Started background directory scan thread for {len(host_dirs)} directories")
+        else:
+            print("Background directory scan already running")
+
+    def generate_metrics_fast(self, hours: int = 24) -> Dict:
+        """Generate metrics quickly without waiting for du to complete"""
+        logs = self.parse_systemd_logs(hours=hours)
+        sessions = self.extract_backup_sessions(logs)
+        dir_stats = self.get_backup_directory_stats_fast()
+        rsync_stats = self.parse_rsync_statistics(hours=hours)
+        
+        # Get latest session
+        latest_session = sessions[-1] if sessions else None
+        
+        # Calculate host status
+        host_status = {}
+        for hostname in self.hosts:
+            host_status[hostname] = {
+                'last_backup_success': False,
+                'last_backup_status': 'unknown',
+                'last_backup_time': None,
+                'last_error': None,
+                'last_warning': None,
+                'total_size_bytes': dir_stats.get(hostname, {}).get('size_bytes', 0),
+                'file_count': dir_stats.get(hostname, {}).get('file_count', 0),
+                'last_modified': dir_stats.get(hostname, {}).get('last_modified'),
+                'scan_complete': hostname in self.du_results,
+                'path_details': [],
+                'status_numeric': 0  # 0=failed, 0.5=warning, 1=success
+            }
+            
+            # Check latest session for this host
+            if latest_session and hostname in latest_session['hosts']:
+                host_data = latest_session['hosts'][hostname]
+                status = host_data.get('status', 'unknown')
+                host_status[hostname]['last_backup_status'] = status
+                host_status[hostname]['last_backup_success'] = status in ['success', 'warning']
+                host_status[hostname]['last_backup_time'] = latest_session['start_time']
+                
+                # Set numeric status for easier dashboard visualization
+                if status == 'success':
+                    host_status[hostname]['status_numeric'] = 1
+                elif status == 'warning':
+                    host_status[hostname]['status_numeric'] = 0.5
+                else:
+                    host_status[hostname]['status_numeric'] = 0
+                
+                # Get path details with status and rsync statistics
+                path_details = []
+                for path_info in host_data.get('paths', []):
+                    path_detail = {
+                        'path': path_info['path'],
+                        'status': path_info['status'],
+                        'timestamp': path_info['timestamp'],
+                        'status_numeric': 1 if path_info['status'] == 'success' else 
+                                        0.5 if path_info['status'] == 'warning' else 0
+                    }
+                    if 'exit_code' in path_info:
+                        path_detail['exit_code'] = path_info['exit_code']
+                    
+                    # Add rsync statistics if available
+                    if hostname in rsync_stats and path_info['path'] in rsync_stats[hostname]:
+                        rsync_data = rsync_stats[hostname][path_info['path']]
+                        path_detail.update({
+                            'bytes_sent': rsync_data.get('bytes_sent', 0),
+                            'bytes_received': rsync_data.get('bytes_received', 0),
+                            'transfer_rate': rsync_data.get('transfer_rate', 0),
+                            'total_size': rsync_data.get('total_size', 0),
+                            'speedup': rsync_data.get('speedup', 0.0)
+                        })
+                    
+                    path_details.append(path_detail)
+                
+                host_status[hostname]['path_details'] = path_details
+                
+                # Get latest error and warning
+                if host_data.get('errors'):
+                    host_status[hostname]['last_error'] = host_data['errors'][-1]['message']
+                if host_data.get('warnings'):
+                    host_status[hostname]['last_warning'] = host_data['warnings'][-1]['message']
+        
+        metrics = {
+            'timestamp': datetime.now().isoformat(),
+            'total_sessions': len(sessions),
+            'background_scan_active': self.du_thread is not None and self.du_thread.is_alive(),
+            'background_scan_complete': self.du_completed.is_set(),
+            'scanned_hosts': len(self.du_results),
+            'total_hosts': len(self.hosts),
+            'latest_session': {
+                'status': latest_session['status'] if latest_session else 'unknown',
+                'start_time': latest_session['start_time'].isoformat() if latest_session else None,
+                'end_time': latest_session.get('end_time').isoformat() if latest_session and latest_session.get('end_time') else None,
+                'duration_seconds': int(latest_session.get('duration', 0)) if latest_session else 0,
+                'error_count': len(latest_session.get('errors', [])) if latest_session else 0,
+                'hosts_attempted': len(latest_session.get('hosts', {})) if latest_session else 0,
+                'hosts_successful': len([h for h in latest_session.get('hosts', {}).values() if h.get('status') != 'failed']) if latest_session else 0
+            },
+            'hosts': host_status,
+            'total_backup_size_bytes': sum(h.get('total_size_bytes', 0) for h in host_status.values()),
+            'total_files': sum(h.get('file_count', 0) for h in host_status.values()),
+            'sessions': sessions[-10:]  # Last 10 sessions for trend analysis
+        }
+        
+        return metrics
+
+    def generate_metrics(self, hours: int = 24) -> Dict:
+        """Original generate_metrics method - kept for compatibility"""
+        return self.generate_metrics_fast(hours)
+
+    def test_influxdb_connection(self):
+        """Test InfluxDB connection and authentication"""
+        try:
+            import requests
+        except ImportError:
+            print("Error: requests library not found. Install with: pip install requests")
+            return False
+        
+        influx_cfg = self.influxdb_config.get('influxdb', {})
+        host = influx_cfg.get('host', 'localhost')
+        port = influx_cfg.get('port', 8086)
+        ssl = influx_cfg.get('ssl', False)
+        
+        # InfluxDB 2.x support - handle both string and None values
+        token = str(influx_cfg.get('token', '')).strip()
+        organization = str(influx_cfg.get('organization', '')).strip()
+        bucket = str(influx_cfg.get('bucket', '')).strip()
+        
+        # Manual fix for organization field - check if it's empty and try to use 'home' as default
+        if not organization and token:
+            print("Warning: Organization field is empty, using 'home' as default")
+            organization = 'home'
+        
+        # InfluxDB 1.x support
+        database = influx_cfg.get('database', 'backup_metrics')
+        username = influx_cfg.get('username', '')
+        password = influx_cfg.get('password', '')
+        
+        # Determine InfluxDB version - check for both token and organization
+        is_influxdb_2x = bool(token and organization)
+        
+        print(f"Testing InfluxDB connection to {host}:{port}...")
+        
+        if is_influxdb_2x:
+            if not bucket:
+                print("❌ Error: InfluxDB 2.x requires bucket to be configured")
+                return False
+            print(f"   Mode: InfluxDB 2.x (Token auth)")
+            print(f"   Organization: {organization}")
+            print(f"   Bucket: {bucket}")
+        else:
+            if token and not organization:
+                print("❌ Error: InfluxDB 2.x token provided but organization is missing")
+                print("   Please check your YAML file and ensure the organization field is properly set")
+                print("   Your config shows: organization: ''")
+                print("   It should be: organization: 'home' or organization: home")
+                return False
+            elif not token and organization:
+                print("❌ Error: InfluxDB 2.x organization provided but token is missing")
+                return False
+            print(f"   Mode: InfluxDB 1.x (Username/Password auth)")
+            print(f"   Database: {database}")
+            if username:
+                print(f"   Username: {username}")
+        
+        protocol = "https" if ssl else "http"
+        
+        # Test different endpoints based on version
+        if is_influxdb_2x:
+            # Test InfluxDB 2.x health endpoint
+            health_url = f"{protocol}://{host}:{port}/health"
+            try:
+                print("   Testing health endpoint...", end=" ")
+                response = requests.get(health_url, timeout=10)
+                if response.status_code == 200:
+                    print("✓")
+                else:
+                    print(f"⚠ (HTTP {response.status_code})")
+            except Exception as e:
+                print(f"❌ ({e})")
+                return False
+            
+            # Test authentication with ready endpoint
+            ready_url = f"{protocol}://{host}:{port}/ready"
+            headers = {'Authorization': f'Token {token}'}
+            try:
+                print("   Testing authentication...", end=" ")
+                response = requests.get(ready_url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    print("✓")
+                else:
+                    print(f"❌ (HTTP {response.status_code} - {response.text})")
+                    return False
+            except Exception as e:
+                print(f"❌ ({e})")
+                return False
+            
+            # Test bucket access with a query
+            query_url = f"{protocol}://{host}:{port}/api/v2/query"
+            headers = {
+                'Authorization': f'Token {token}',
+                'Content-Type': 'application/vnd.flux'
+            }
+            params = {'org': organization}
+            # Simple flux query to test bucket access
+            flux_query = f'buckets() |> filter(fn: (r) => r.name == "{bucket}") |> limit(n:1)'
+            
+            try:
+                print("   Testing bucket access...", end=" ")
+                response = requests.post(query_url, params=params, headers=headers, 
+                                       data=flux_query, timeout=10)
+                if response.status_code == 200:
+                    print("✓")
+                else:
+                    print(f"❌ (HTTP {response.status_code} - {response.text})")
+                    return False
+            except Exception as e:
+                print(f"❌ ({e})")
+                return False
+                
+        else:
+            # Test InfluxDB 1.x ping endpoint
+            ping_url = f"{protocol}://{host}:{port}/ping"
+            try:
+                print("   Testing ping endpoint...", end=" ")
+                response = requests.get(ping_url, timeout=10)
+                if response.status_code == 204:
+                    print("✓")
+                else:
+                    print(f"⚠ (HTTP {response.status_code})")
+            except Exception as e:
+                print(f"❌ ({e})")
+                return False
+            
+            # Test database query
+            query_url = f"{protocol}://{host}:{port}/query"
+            params = {
+                "q": "SHOW DATABASES",
+                "db": database
+            }
+            if username and password:
+                params["u"] = username
+                params["p"] = password
+            
+            try:
+                print("   Testing database access...", end=" ")
+                response = requests.get(query_url, params=params, timeout=10)
+                if response.status_code == 200:
+                    result = response.json()
+                    if 'results' in result and result['results']:
+                        print("✓")
+                    else:
+                        print(f"❌ (Invalid response format)")
+                        return False
+                else:
+                    print(f"❌ (HTTP {response.status_code} - {response.text})")
+                    return False
+            except Exception as e:
+                print(f"❌ ({e})")
+                return False
+        
+        print("✅ InfluxDB connection test successful!")
+        return True
+
+    def query_influxdb_data(self, hours: int = 24):
+        """Query and display existing data from InfluxDB"""
+        try:
+            import requests
+        except ImportError:
+            print("Error: requests library not found. Install with: pip install requests")
+            return False
+        
+        influx_cfg = self.influxdb_config.get('influxdb', {})
+        host = influx_cfg.get('host', 'localhost')
+        port = influx_cfg.get('port', 8086)
+        ssl = influx_cfg.get('ssl', False)
+        
+        # InfluxDB 2.x support
+        token = str(influx_cfg.get('token', '')).strip()
+        organization = str(influx_cfg.get('organization', '')).strip()
+        bucket = str(influx_cfg.get('bucket', '')).strip()
+        
+        if not organization and token:
+            organization = 'home'
+        
+        # InfluxDB 1.x support
+        database = influx_cfg.get('database', 'backup_metrics')
+        username = influx_cfg.get('username', '')
+        password = influx_cfg.get('password', '')
+        
+        is_influxdb_2x = bool(token and organization)
+        protocol = "https" if ssl else "http"
+        
+        if is_influxdb_2x:
+            print(f"Querying InfluxDB 2.x data from {host}:{port} (last {hours} hours)")
+            print(f"Organization: {organization}, Bucket: {bucket}")
+            
+            # Enhanced queries that specifically look for error messages
+            queries = {
+                "Backup Status": f'from(bucket: "{bucket}") |> range(start: -{hours}h) |> filter(fn: (r) => r._measurement == "backup_status") |> last()',
+                "Host Status (Basic)": f'from(bucket: "{bucket}") |> range(start: -{hours}h) |> filter(fn: (r) => r._measurement == "backup_host_status" and (r._field == "status_numeric" or r._field == "error_count" or r._field == "volume_count")) |> last()',
+                "Error Messages": f'from(bucket: "{bucket}") |> range(start: -{hours}h) |> filter(fn: (r) => r._measurement == "backup_host_status" and (r._field == "last_error" or r._field == "last_warning")) |> filter(fn: (r) => r._value != "") |> last()',
+                "Volume Status (Errors)": f'from(bucket: "{bucket}") |> range(start: -{hours}h) |> filter(fn: (r) => r._measurement == "backup_volume_status" and (r._field == "exit_code" or r._field == "status_numeric")) |> filter(fn: (r) => r._value != 0 and r._value != 1.0) |> last()',
+                "Recent Host Sizes": f'from(bucket: "{bucket}") |> range(start: -{hours}h) |> filter(fn: (r) => r._measurement == "backup_host_size") |> last()'
+            }
+            
+            for query_name, flux_query in queries.items():
+                print(f"\n=== {query_name} ===")
+                url = f"{protocol}://{host}:{port}/api/v2/query"
+                headers = {
+                    'Authorization': f'Token {token}',
+                    'Content-Type': 'application/vnd.flux'
+                }
+                params = {'org': organization}
+                
+                try:
+                    response = requests.post(url, params=params, data=flux_query, headers=headers, timeout=30)
+                    
+                    if response.status_code == 200:
+                        result = response.text.strip()
+                        if result and not result.startswith('#'):
+                            # Parse CSV-like output and format it better for error messages
+                            lines = result.split('\n')
+                            data_lines = [line for line in lines if line.strip() and not line.startswith('#')]
+                            
+                            if len(data_lines) > 1:
+                                # Parse header
+                                header_line = data_lines[0]
+                                columns = header_line.split(',')
+                                
+                                # Find relevant column indices
+                                try:
+                                    host_idx = columns.index('host') if 'host' in columns else -1
+                                    field_idx = columns.index('_field') if '_field' in columns else -1
+                                    value_idx = columns.index('_value') if '_value' in columns else -1
+                                    time_idx = columns.index('_time') if '_time' in columns else -1
+                                    path_idx = columns.index('path') if 'path' in columns else -1
+                                except ValueError:
+                                    # Fallback to basic display
+                                    for i, line in enumerate(data_lines[:11]):
+                                        print(f"  {line}")
+                                        if i == 10 and len(data_lines) > 11:
+                                            print(f"  ... and {len(data_lines) - 11} more rows")
+                                    continue
+                                
+                                # Format error messages nicely
+                                if query_name == "Error Messages":
+                                    print("  Host-specific errors and warnings:")
+                                    for line in data_lines[1:]:
+                                        parts = line.split(',')
+                                        if len(parts) > max(host_idx, field_idx, value_idx, time_idx):
+                                            host = parts[host_idx] if host_idx >= 0 else 'unknown'
+                                            field = parts[field_idx] if field_idx >= 0 else 'unknown'
+                                            value = parts[value_idx] if value_idx >= 0 else 'unknown'
+                                            timestamp = parts[time_idx] if time_idx >= 0 else 'unknown'
+                                            
+                                            # Clean up timestamp
+                                            if timestamp != 'unknown':
+                                                try:
+                                                    # Convert from ISO format to readable
+                                                    from datetime import datetime
+                                                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                                                    timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
+                                                except:
+                                                    pass
+                                            
+                                            # Clean up value (remove quotes if present)
+                                            value = value.strip('"').replace('\\"', '"')
+                                            
+                                            error_type = "ERROR" if field == "last_error" else "WARNING"
+                                            print(f"    [{timestamp}] {host}: {error_type}")
+                                            print(f"      {value}")
+                                
+                                elif query_name == "Volume Status (Errors)":
+                                    print("  Volumes with errors (non-zero exit codes):")
+                                    for line in data_lines[1:]:
+                                        parts = line.split(',')
+                                        if len(parts) > max(host_idx, field_idx, value_idx, path_idx):
+                                            host = parts[host_idx] if host_idx >= 0 else 'unknown'
+                                            path = parts[path_idx] if path_idx >= 0 else 'unknown'
+                                            field = parts[field_idx] if field_idx >= 0 else 'unknown'
+                                            value = parts[value_idx] if value_idx >= 0 else 'unknown'
+                                            
+                                            if field == "exit_code" and value != "0":
+                                                print(f"    {host}:{path} - Exit code: {value}")
+                                            elif field == "status_numeric" and value not in ["1.0", "1"]:
+                                                status = "WARNING" if value == "0.5" else "FAILED"
+                                                print(f"    {host}:{path} - Status: {status} ({value})")
+                                
+                                else:
+                                    # Standard display for other queries
+                                    for i, line in enumerate(data_lines[:11]):
+                                        print(f"  {line}")
+                                        if i == 10 and len(data_lines) > 11:
+                                            remaining = len(data_lines) - 11
+                                            print(f"  ... and {remaining} more")
+                                            break
+                            else:
+                                print("  No data found")
+                        else:
+                            print("  No data found")
+                    else:
+                        print(f"  Query failed: HTTP {response.status_code} - {response.text}")
+                        
+                except Exception as e:
+                    print(f"  Query error: {e}")
+        else:
+            print(f"Querying InfluxDB 1.x data from {host}:{port} (last {hours} hours)")
+            print(f"Database: {database}")
+            
+            # Enhanced InfluxDB 1.x queries that look for error messages
+            queries = {
+                "Backup Status": f'SELECT * FROM "backup_status" WHERE time > now() - {hours}h ORDER BY time DESC LIMIT 10',
+                "Host Status (Basic)": f'SELECT host, status_numeric, error_count, volume_count FROM "backup_host_status" WHERE time > now() - {hours}h ORDER BY time DESC LIMIT 20',
+                "Error Messages": f'SELECT host, last_error, last_warning FROM "backup_host_status" WHERE time > now() - {hours}h AND (last_error != \'\' OR last_warning != \'\') ORDER BY time DESC LIMIT 20',
+                "Volume Errors": f'SELECT host, path, exit_code, status_numeric FROM "backup_volume_status" WHERE time > now() - {hours}h AND (exit_code != 0 OR status_numeric != 1.0) ORDER BY time DESC LIMIT 20',
+                "Host Sizes": f'SELECT host, size_bytes, file_count FROM "backup_host_size" WHERE time > now() - {hours}h ORDER BY time DESC LIMIT 10'
+            }
+            
+            for measurement, influx_query in queries.items():
+                print(f"\n=== {measurement} ===")
+                
+                url = f"{protocol}://{host}:{port}/query"
+                params = {
+                    'db': database,
+                    'q': influx_query
+                }
+                
+                if username and password:
+                    params['u'] = username
+                    params['p'] = password
+                
+                try:
+                    response = requests.get(url, params=params, timeout=30)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if 'results' in data and data['results']:
+                            result = data['results'][0]
+                            if 'series' in result and result['series']:
+                                series = result['series'][0]
+                                columns = series.get('columns', [])
+                                values = series.get('values', [])
+                                
+                                if values:
+                                    # Format error messages nicely for InfluxDB 1.x too
+                                    if measurement == "Error Messages":
+                                        print("  Recent errors and warnings:")
+                                        for row in values:
+                                            row_dict = dict(zip(columns, row))
+                                            host = row_dict.get('host', 'unknown')
+                                            last_error = row_dict.get('last_error', '')
+                                            last_warning = row_dict.get('last_warning', '')
+                                            timestamp = row_dict.get('time', '')
+                                            
+                                            if last_error:
+                                                print(f"    [{timestamp}] {host}: ERROR")
+                                                print(f"      {last_error}")
+                                            if last_warning:
+                                                print(f"    [{timestamp}] {host}: WARNING") 
+                                                print(f"      {last_warning}")
+                                    else:
+                                        # Standard display
+                                        print(f"  Columns: {', '.join(columns)}")
+                                        for i, row in enumerate(values[:5]):
+                                            print(f"  Row {i+1}: {row}")
+                                        if len(values) > 5:
+                                            print(f"  ... and {len(values) - 5} more")
+                                else:
+                                    print("  No data found")
+                            else:
+                                print("  No data found")
+                        else:
+                            print("  No data found")
+                    else:
+                        print(f"  Query failed: HTTP {response.status_code} - {response.text}")
+                        
+                except Exception as e:
+                    print(f"  Query error: {e}")
+        
+        return True
+
+    def send_to_influxdb(self, host: str = None, port: int = None, database: str = None, 
+                        username: str = None, password: str = None, ssl: bool = None,
+                        token: str = None, organization: str = None, bucket: str = None):
+        """Send metrics directly to InfluxDB via HTTP API with consistent schema"""
+        try:
+            import requests
+        except ImportError:
+            print("Error: requests library not found. Install with: pip install requests")
+            return False
+        
+        # Use configured values if not overridden
+        influx_cfg = self.influxdb_config.get('influxdb', {})
+        host = host or influx_cfg.get('host', 'localhost')
+        port = port or influx_cfg.get('port', 8086)
+        ssl = ssl if ssl is not None else influx_cfg.get('ssl', False)
+        
+        # InfluxDB 2.x support - handle both string and None values, strip whitespace
+        token = str(token or influx_cfg.get('token', '')).strip()
+        organization = str(organization or influx_cfg.get('organization', '')).strip()
+        bucket = str(bucket or influx_cfg.get('bucket', '')).strip()
+        
+        # Manual fix for organization field - use 'home' as default if empty but token exists
+        if not organization and token:
+            organization = 'home'
+        
+        # InfluxDB 1.x support
+        database = database or influx_cfg.get('database', 'backup_metrics')
+        username = username or influx_cfg.get('username', '')
+        password = password or influx_cfg.get('password', '')
+        
+        # Determine InfluxDB version based on available config
+        # Prioritize token-based auth if both token and organization are provided
+        is_influxdb_2x = bool(token and organization)
+        
+        if is_influxdb_2x:
+            if not bucket:
+                print("Error: InfluxDB 2.x requires bucket to be configured")
+                print("Please add 'bucket: your-bucket-name' to your influxdb-config.yaml")
+                return False
+            print(f"Sending metrics to InfluxDB 2.x at {host}:{port}, organization: {organization}, bucket: {bucket}")
+        else:
+            print(f"Sending metrics to InfluxDB 1.x at {host}:{port}, database: {database}")
+        
+        # Get latest session data
+        metrics = self.generate_metrics_fast()
+        latest_session = metrics.get('latest_session', {})
+        
+        # Extract error_count from the latest session
+        error_count = latest_session.get('error_count', 0)
+        
+        # Generate InfluxDB line protocol with consistent schema
+        lines = []
+        timestamp_ns = int(time.time() * 1_000_000_000)
+        
+        # Helper function to escape strings for InfluxDB line protocol
+        def escape_string(s):
+            """Escape string for InfluxDB line protocol"""
+            if not s:
+                return ""
+            # Replace problematic characters
+            s = str(s).replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+            # Wrap in quotes if it contains spaces or special chars
+            if any(c in s for c in [' ', ',', '=', '\t']):
+                return f'"{s}"'
+            return s
+        
+        # 1. Overall backup status with status_numeric
+        latest_session = metrics.get('latest_session', {})
+        status = latest_session.get('status', 'unknown')
+        
+        # Map status to numeric: success=1.0, warning=0.5, failed/unknown=0.0
+        if status == 'success':
+            overall_status_numeric = 1.0
+        elif status == 'warning':
+            overall_status_numeric = 0.5
+        else:
+            overall_status_numeric = 0.0
+        
+        # Overall backup status measurement
+        duration = latest_session.get('duration_seconds', 0)
+        error_count = latest_session.get('error_count', 0)
+        total_size = metrics.get('total_backup_size_bytes', 0)
+        scan_progress = metrics.get('scanned_hosts', 0) / max(metrics.get('total_hosts', 1), 1)
+        
+        backup_status_line = (
+            f"backup_status "
+            f"status_numeric={overall_status_numeric},"
+            f"duration_seconds={float(duration)},"
+            f"error_count={error_count}i,"
+            f"total_size_bytes={total_size}i,"
+            f"scan_progress={scan_progress},"
+            f"host_count={metrics.get('total_hosts', 0)}i,"
+            f"volume_count={sum(len(h.get('path_details', [])) for h in metrics.get('hosts', {}).values())}i "
+            f"{timestamp_ns}"
+        )
+        lines.append(backup_status_line)
+        
+        # 2. Host-level status with status_numeric and error/warning messages
+        for hostname, host_data in metrics.get('hosts', {}).items():
+            # Calculate host status_numeric from path details
+            path_details = host_data.get('path_details', [])
+            if path_details:
+                # Use minimum status from all paths (most conservative)
+                host_status_numeric = min(p.get('status_numeric', 0.0) for p in path_details)
+            else:
+                # Fallback to last_backup_success
+                host_status_numeric = 1.0 if host_data.get('last_backup_success', False) else 0.0
+            
+            # Host metrics
+            size_bytes = host_data.get('total_size_bytes', 0)
+            file_count = host_data.get('file_count', 0)
+            scan_complete = 1 if host_data.get('scan_complete', False) else 0
+            volume_count = len(path_details)
+            
+            # Calculate averages from path details
+            if path_details:
+                avg_transfer_rate = sum(p.get('transfer_rate', 0) for p in path_details) / len(path_details)
+                avg_speedup = sum(p.get('speedup', 0) for p in path_details) / len(path_details)
+                # Calculate total rsync stats
+                total_bytes_sent = sum(p.get('bytes_sent', 0) for p in path_details)
+                total_bytes_received = sum(p.get('bytes_received', 0) for p in path_details)
+            else:
+                avg_transfer_rate = 0
+                avg_speedup = 0
+                total_bytes_sent = 0
+                total_bytes_received = 0
+            
+            # Add error and warning messages as fields
+            last_error = escape_string(host_data.get('last_error', ''))
+            last_warning = escape_string(host_data.get('last_warning', ''))
+            
+            host_status_line = (
+                f"backup_host_status,host={hostname} "
+                f"status_numeric={host_status_numeric},"
+                f"size_bytes={size_bytes}i,"
+                f"file_count={file_count}i,"
+                f"scan_complete={scan_complete}i,"
+                f"volume_count={volume_count}i,"
+                f"avg_transfer_rate={int(avg_transfer_rate)}i,"
+                f"avg_speedup={avg_speedup},"
+                f"total_bytes_sent={total_bytes_sent}i,"
+                f"total_bytes_received={total_bytes_received}i,"
+                f"last_run_timestamp={timestamp_ns}i"
+            )
+            
+            # Add error/warning messages as separate fields if they exist
+            if last_error:
+                host_status_line += f",last_error={last_error}"
+            if last_warning:
+                host_status_line += f",last_warning={last_warning}"
+            
+            host_status_line += f" {timestamp_ns}"
+            lines.append(host_status_line)
+            
+            # 3. Volume-level status (if path details available)
+            for path_detail in path_details:
+                path = path_detail.get('path', 'unknown')
+                # Escape path for InfluxDB line protocol (replace spaces and special chars)
+                path_escaped = path.replace(' ', '\\ ').replace(',', '\\,').replace('=', '\\=')
+                
+                volume_status_numeric = path_detail.get('status_numeric', 0.0)
+                exit_code = path_detail.get('exit_code', 1)
+                bytes_sent = path_detail.get('bytes_sent', 0)
+                bytes_received = path_detail.get('bytes_received', 0)
+                transfer_rate = path_detail.get('transfer_rate', 0)
+                total_size = path_detail.get('total_size', 0)
+                speedup = path_detail.get('speedup', 0)
+                
+                # Check if we can get error/warning message for this specific path
+                # This would require enhancing the metrics collection to track per-path errors
+                volume_error_msg = ""
+                volume_warning_msg = ""
+                
+                # Create a detailed rsync metrics measurement for each volume
+                volume_status_line = (
+                    f"backup_volume_status,host={hostname},path={path_escaped} "
+                    f"status_numeric={volume_status_numeric},"
+                    f"exit_code={exit_code}i,"
+                    f"bytes_sent={bytes_sent}i,"
+                    f"bytes_received={bytes_received}i,"
+                    f"transfer_rate={int(transfer_rate)}i,"
+                    f"total_size={total_size}i,"
+                    f"speedup={speedup}"
+                )
+                
+                # Add error/warning messages if available
+                if volume_error_msg:
+                    volume_status_line += f",error_message={escape_string(volume_error_msg)}"
+                if volume_warning_msg:
+                    volume_status_line += f",warning_message={escape_string(volume_warning_msg)}"
+                
+                volume_status_line += f" {timestamp_ns}"
+                lines.append(volume_status_line)
+            
+        # 4. Add a separate measurement for rsync performance metrics
+        rsync_stats = self.parse_rsync_statistics(hours=24)  # Get most recent rsync stats
+        if rsync_stats:
+            for hostname, host_paths in rsync_stats.items():
+                for path, stats in host_paths.items():
+                    # Escape path for InfluxDB line protocol
+                    path_escaped = path.replace(' ', '\\ ').replace(',', '\\,').replace('=', '\\=')
+                    
+                    # Create dedicated rsync performance measurement
+                    rsync_perf_line = (
+                        f"backup_rsync_performance,host={hostname},path={path_escaped} "
+                        f"bytes_sent={stats.get('bytes_sent', 0)}i,"
+                        f"bytes_received={stats.get('bytes_received', 0)}i,"
+                        f"transfer_rate={int(stats.get('transfer_rate', 0))}i,"
+                        f"total_size={stats.get('total_size', 0)}i,"
+                        f"speedup={stats.get('speedup', 1.0)} "
+                        f"{timestamp_ns}"
+                    )
+                    lines.append(rsync_perf_line)
+        
+        if self.verbose:
+            print(f"Generated {len(lines)} metrics lines:")
+            for line in lines[:3]:  # Show first 3 lines as example
+                print(f"  {line}")
+            if len(lines) > 3:
+                print(f"  ... and {len(lines) - 3} more")
+        
+        # Send to InfluxDB
+        protocol = "https" if ssl else "http"
+        data = '\n'.join(lines)
+        
+        if is_influxdb_2x:
+            # InfluxDB 2.x API
+            url = f"{protocol}://{host}:{port}/api/v2/write"
+            headers = {
+                'Authorization': f'Token {token}',
+                'Content-Type': 'text/plain; charset=utf-8'
+            }
+            params = {
+                'org': organization,
+                'bucket': bucket,
+                'precision': 'ns'
+            }
+        else:
+            # InfluxDB 1.x API
+            url = f"{protocol}://{host}:{port}/write"
+            headers = {'Content-Type': 'application/octet-stream'}
+            params = {"db": database}
+            if username and password:
+                params["u"] = username
+                params["p"] = password
+        
+        try:
+            response = requests.post(url, params=params, data=data, headers=headers, timeout=30)
+            
+            if response.status_code == 204:
+                influx_version = "2.x" if is_influxdb_2x else "1.x"
+                print(f"✅ Successfully sent {len(lines)} metrics to InfluxDB {influx_version} at {host}:{port}")
+                return True
+            else:
+                print(f"❌ Error sending to InfluxDB: HTTP {response.status_code} - {response.text}")
+                if is_influxdb_2x and response.status_code == 401:
+                    print("Hint: Check your token permissions and organization/bucket configuration")
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Error connecting to InfluxDB: {e}")
+            return False
+
+    def delete_all_backup_data(self):
+        """Delete all backup metrics data from InfluxDB - for development use only."""
+        print("🗑️  WARNING: Deleting ALL backup data from InfluxDB...")
+        print("This will remove all data from measurements: backup_status, backup_host_status, backup_volume_status")
+        
+        confirmation = input("Type 'DELETE ALL DATA' to confirm: ")
+        if confirmation != "DELETE ALL DATA":
+            print("❌ Deletion cancelled.")
+            return False
+        
+        try:
+            import requests
+            
+            # Get InfluxDB config section
+            influx_cfg = self.influxdb_config.get('influxdb', {})
+            host = influx_cfg.get('host', 'localhost')
+            port = influx_cfg.get('port', 8086)
+            ssl = influx_cfg.get('ssl', False)
+            
+            # InfluxDB 2.x support
+            token = str(influx_cfg.get('token', '')).strip()
+            organization = str(influx_cfg.get('organization', '')).strip()
+            bucket = str(influx_cfg.get('bucket', '')).strip()
+            
+            if not organization and token:
+                organization = 'home'
+            
+            is_influxdb_2x = bool(token and organization)
+            
+            if is_influxdb_2x:
+                # InfluxDB 2.x - use delete API
+                protocol = "https" if ssl else "http"
+                url = f"{protocol}://{host}:{port}/api/v2/delete"
+                
+                headers = {
+                    'Authorization': f"Token {token}",
+                    'Content-Type': 'application/json'
+                }
+                
+                # Delete each measurement separately
+                measurements = ["backup_status", "backup_host_status", "backup_volume_status"]
+                
+                for measurement in measurements:
+                    delete_data = {
+                        "start": "1970-01-01T00:00:00Z",
+                        "stop": "2099-12-31T23:59:59Z",
+                        "predicate": f'_measurement="{measurement}"'
+                    }
+                    
+                    params = {
+                        'org': organization,
+                        'bucket': bucket
+                    }
+                    
+                    print(f"Deleting {measurement}...")
+                    
+                    response = requests.post(url, 
+                                           headers=headers, 
+                                           params=params,
+                                           json=delete_data,
+                                           timeout=30)
+                    
+                    if response.status_code == 204:
+                        print(f"✅ Deleted {measurement}")
+                    else:
+                        print(f"❌ Failed to delete {measurement}: HTTP {response.status_code} - {response.text}")
+                        return False
+                        
+            else:
+                # InfluxDB 1.x - use different approach
+                print("❌ InfluxDB 1.x delete not implemented. Please use InfluxDB 2.x for this feature.")
+                return False
+                
+            print("✅ All backup data deleted successfully!")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error deleting data: {e}")
+            return False
+
+    def _parse_btrfs_du_output(self, output: str, path: str) -> int:
+        """Parse btrfs filesystem du output to extract size in bytes
+        
+        Expected format (table):
+             Total   Exclusive  Set shared  Filename
+        56736215040      348160  19454402560  /share/backup/fhem2
+        
+        Or alternative format: "Total: 1234567890 bytes"
+        """
+        try:
+            lines = output.strip().split('\n')
+            
+            # Method 1: Look for table format (most common)
+            for i, line in enumerate(lines):
+                line = line.strip()
+                
+                # Skip header line if it contains "Total   Exclusive"
+                if "Total" in line and "Exclusive" in line and "Filename" in line:
+                    continue
+                
+                # Look for data line that ends with the target path
+                if line.endswith(path):
+                    # Split the line and get the first number (Total column)
+                    parts = line.split()
+                    if len(parts) >= 4:  # Should have Total, Exclusive, Set shared, Filename
+                        try:
+                            total_size = int(parts[0])
+                            return total_size
+                        except ValueError:
+                            continue
+            
+            # Method 2: Look for "Total:" format
+            for line in lines:
+                if line.strip().startswith('Total:'):
+                    # Extract the number from "Total: 1234567890 bytes"
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        # Remove commas if present and convert to int
+                        size_str = parts[1].replace(',', '')
+                        return int(size_str)
+            
+            # Method 3: Try to find any line with just numbers (fallback)
+            for line in lines:
+                line = line.strip()
+                if line and not any(header in line for header in ['Total', 'Exclusive', 'Filename']):
+                    # Try to extract first number from the line
+                    import re
+                    numbers = re.findall(r'\d+', line.replace(',', ''))
+                    if numbers:
+                        # Take the largest number (likely the total size)
+                        sizes = [int(n) for n in numbers]
+                        return max(sizes)
+            
+            # If all parsing fails, return 0
+            print(f"Warning: Could not parse btrfs du output for {path}:\n{output}")
+            return 0
+            
+        except (ValueError, IndexError) as e:
+            print(f"Error: Error parsing btrfs du output for {path}: {e}")
+            return 0
+
+    def print_last_runs(self, run_offset: int = 0, number_of_runs: int = 1, filter_host: str = None, hours: int = 168):
+        """Print log messages from the last backup runs with optional host filtering
+        
+        Args:
+            run_offset: Which run to start from (0=last, 1=second last, etc.)
+            number_of_runs: How many runs to display
+            filter_host: Optional hostname to filter messages
+            hours: How many hours back to search (default 1 week)
+        """
+        print(f"Retrieving backup run logs (last {hours} hours)...")
+        
+        # Get systemd logs
+        logs = self.parse_systemd_logs(hours=hours)
+        if not logs:
+            print("No backup logs found in the specified time period")
+            return
+        
+        # Extract backup sessions
+        sessions = self.extract_backup_sessions(logs)
+        if not sessions:
+            print("No complete backup sessions found")
+            return
+        
+        # Sort sessions by start time (most recent first)
+        sessions.sort(key=lambda x: x['start_time'], reverse=True)
+        
+        # Validate run offset
+        if run_offset >= len(sessions):
+            print(f"Error: Only {len(sessions)} backup runs found, cannot access run {run_offset + 1}")
+            return
+        
+        # Calculate which sessions to display
+        start_idx = run_offset
+        end_idx = min(start_idx + number_of_runs, len(sessions))
+        selected_sessions = sessions[start_idx:end_idx]
+        
+        print(f"\n=== Displaying {len(selected_sessions)} backup run(s) ===")
+        if filter_host:
+            print(f"Filtering for host: {filter_host}")
+        
+        # For each selected session, find and display relevant log messages
+        for i, session in enumerate(selected_sessions):
+            session_num = start_idx + i + 1
+            print(f"\n{'='*60}")
+            print(f"BACKUP RUN #{session_num} (Run {start_idx + i + 1} from most recent)")
+            print(f"{'='*60}")
+            print(f"Start Time: {session['start_time']}")
+            print(f"End Time: {session.get('end_time', 'N/A')}")
+            print(f"Status: {session['status']}")
+            print(f"Duration: {session.get('duration', 0):.1f} seconds")
+            print(f"Hosts: {list(session['hosts'].keys())}")
+            
+            # Find log messages for this session
+            session_logs = self._get_session_logs(logs, session, filter_host)
+            
+            if not session_logs:
+                if filter_host:
+                    print(f"\nNo log messages found for host '{filter_host}' in this session")
+                else:
+                    print("\nNo log messages found for this session")
+                continue
+            
+            print(f"\nLog Messages ({len(session_logs)} entries):")
+            print("-" * 60)
+            
+            # Display log messages with timestamps
+            for log_entry in session_logs:
+                timestamp = log_entry.get('__REALTIME_TIMESTAMP')
+                if timestamp:
+                    ts = datetime.fromtimestamp(int(timestamp) / 1000000)
+                    time_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    time_str = "Unknown"
+                
+                message = log_entry.get('MESSAGE', '')
+                # Clean up ANSI escape sequences
+                if isinstance(message, list):
+                    try:
+                        message = bytes(message).decode('utf-8', errors='ignore')
+                    except:
+                        message = str(message)
+                
+                # Remove ANSI escape sequences
+                message = re.sub(r'\x1b\[[0-9;]*m', '', str(message))
+                
+                print(f"[{time_str}] {message}")
+        
+        print(f"\n{'='*60}")
+        print(f"Displayed {len(selected_sessions)} backup run(s)")
+        if filter_host:
+            print(f"Filtered for host: {filter_host}")
+
+    def _get_session_logs(self, all_logs: List[Dict], session: Dict, filter_host: str = None) -> List[Dict]:
+        """Get log messages that belong to a specific backup session"""
+        session_start = session['start_time']
+        session_end = session.get('end_time', datetime.now())
+        
+        # Add some buffer time around the session
+        buffer_minutes = 5
+        start_time = session_start - timedelta(minutes=buffer_minutes)
+        end_time = session_end + timedelta(minutes=buffer_minutes)
+        
+        session_logs = []
+        current_host_context = None
+        
+        for log in all_logs:
+            # Parse timestamp
+            timestamp = log.get('__REALTIME_TIMESTAMP')
+            if not timestamp:
+                continue
+            
+            log_time = datetime.fromtimestamp(int(timestamp) / 1000000)
+            
+            # Check if log entry is within session time range
+            if not (start_time <= log_time <= end_time):
+                continue
+            
+            message = log.get('MESSAGE', '')
+            if isinstance(message, list):
+                try:
+                    message = bytes(message).decode('utf-8', errors='ignore')
+                except:
+                    message = str(message)
+            
+            # Remove ANSI escape sequences for pattern matching
+            clean_message = re.sub(r'\x1b\[[0-9;]*m', '', str(message))
+            
+            # Track current host context
+            host_match = re.search(r'=== Starting backup for (\w+)', clean_message)
+            if host_match:
+                current_host_context = host_match.group(1)
+            
+            # Host completion resets context
+            if re.search(r'Host backup (?:completed|failed)', clean_message):
+                current_host_context = None
+            
+            # If filtering by host, apply the filter
+            if filter_host:
+                # Check if message explicitly mentions the host
+                host_mentioned = False
+                
+                # Look for explicit host mentions in various patterns
+                host_patterns = [
+                    rf'=== Starting backup for {re.escape(filter_host)}',
+                    rf'Host backup .+?: {re.escape(filter_host)}',
+                    rf'Volume backup .+?: {re.escape(filter_host)}:',
+                    rf'{re.escape(filter_host)}:',
+                    rf'host.*{re.escape(filter_host)}',
+                    rf'{re.escape(filter_host)}\b'  # Word boundary to avoid partial matches
+                ]
+                
+                for pattern in host_patterns:
+                    if re.search(pattern, clean_message, re.IGNORECASE):
+                        host_mentioned = True
+                        break
+                
+                # Also include if we're in the context of this host
+                in_host_context = (current_host_context == filter_host)
+                
+                # Include global messages that aren't host-specific
+                is_global_message = any(pattern in clean_message.lower() for pattern in [
+                    'backup script - live mode',
+                    'starting backup operations',
+                    'backup operations completed',
+                    'backup script exited',
+                    'all backups completed'
+                ])
+                
+                # Skip if not relevant to the requested host
+                if not (host_mentioned or in_host_context or is_global_message):
+                    continue
+            
+            # Include this log entry
+            session_logs.append(log)
+        
+        return session_logs
+
+    def _detect_backup_frequency(self) -> int:
+        """Detect backup frequency from systemd timers and return appropriate hours to search"""
+        try:
+            # Check systemctl list-timers for backup.timer
+            result = subprocess.run(
+                ["systemctl", "list-timers", "--all", "--no-pager"],
+                capture_output=True, text=True, check=True, timeout=10
+            )
+            
+            # Look for backup-related timers
+            backup_timers = []
+            for line in result.stdout.split('\n'):
+                if 'backup' in line.lower() and ('timer' in line.lower() or '.timer' in line):
+                    backup_timers.append(line.strip())
+            
+            if backup_timers:
+                if self.verbose:
+                    print(f"[DEBUG] Found backup timers: {backup_timers}")
+                
+                # If timer shows '-' for NEXT, it might be disabled - check the timer unit itself
+                for timer_line in backup_timers:
+                    if 'backup.timer' in timer_line:
+                        if self.verbose:
+                            print(f"[DEBUG] Checking backup.timer configuration...")
+                        
+                        # Try to get timer details from systemctl show
+                        try:
+                            show_result = subprocess.run(
+                                ["systemctl", "show", "backup.timer"],
+                                capture_output=True, text=True, check=True, timeout=5
+                            )
+                            
+                            # Parse TimersCalendar property which contains the OnCalendar info
+                            for show_line in show_result.stdout.split('\n'):
+                                if show_line.startswith('TimersCalendar='):
+                                    # Extract calendar spec from TimersCalendar={ OnCalendar=*-*-* 00/2:00:00 ; ... }
+                                    timers_info = show_line.split('=', 1)[1].strip()
+                                    if self.verbose:
+                                        print(f"[DEBUG] Found TimersCalendar={timers_info}")
+                                    
+                                    # Parse OnCalendar from the TimersCalendar field
+                                    import re
+                                    calendar_match = re.search(r'OnCalendar=([^;]+)', timers_info)
+                                    if calendar_match:
+                                        calendar_spec = calendar_match.group(1).strip()
+                                        if self.verbose:
+                                            print(f"[DEBUG] Extracted OnCalendar={calendar_spec}")
+                                        
+                                        # Parse calendar specifications
+                                        if calendar_spec in ['hourly', '*:0:0', '*-*-* *:0:0']:
+                                            return 6  # 6 hours for hourly backups
+                                        elif '00/2:00' in calendar_spec or '*-*-* 00/2:00:00' in calendar_spec:
+                                            return 6  # 6 hours for every 2 hours (3 runs expected)
+                                        elif '00/4:00' in calendar_spec or '*-*-* 00/4:00:00' in calendar_spec:
+                                            return 12  # 12 hours for every 4 hours  
+                                        elif '00/6:00' in calendar_spec or '*-*-* 00/6:00:00' in calendar_spec:
+                                            return 18  # 18 hours for every 6 hours
+                                        elif calendar_spec in ['daily', '*-*-* 00:00:00']:
+                                            return 48  # 48 hours for daily backups
+                                        elif 'weekly' in calendar_spec.lower() or 'Mon *-*-*' in calendar_spec:
+                                            return 240  # 10 days for weekly backups
+                                        else:
+                                            # Try to extract frequency from unknown formats
+                                            # Look for /N patterns like 00/2:00:00 meaning every 2 hours
+                                            freq_match = re.search(r'(\d+)/(\d+):', calendar_spec)
+                                            if freq_match:
+                                                interval_hours = int(freq_match.group(2))
+                                                if self.verbose:
+                                                    print(f"[DEBUG] Detected {interval_hours}-hour interval from calendar spec")
+                                                # Return 3x the interval to catch multiple runs
+                                                return max(6, interval_hours * 3)
+                                    
+                        except Exception as e:
+                            if self.verbose:
+                                print(f"[DEBUG] Could not get timer details: {e}")
+                
+                # Parse timer frequency from the list-timers output (fallback)
+                for timer_line in backup_timers:
+                    # Look for frequency indicators in the timer line
+                    if any(freq in timer_line.lower() for freq in ['hourly', 'every hour', '1h']):
+                        return 6  # 6 hours for hourly backups
+                    elif any(freq in timer_line.lower() for freq in ['4h', 'every 4', '6h', 'every 6']):
+                        return 12  # 12 hours for 4-6 hourly backups
+                    elif any(freq in timer_line.lower() for freq in ['daily', 'every day', '24h', '1d']):
+                        return 48  # 48 hours for daily backups
+                    elif any(freq in timer_line.lower() for freq in ['weekly', 'every week', '7d']):
+                        return 240  # 10 days for weekly backups
+            
+            # Fallback: check recent backup runs to estimate frequency
+            try:
+                logs = self.parse_systemd_logs(hours=168)  # Look at past week
+                sessions = self.extract_backup_sessions(logs)
+                
+                if len(sessions) >= 2:
+                    # Calculate average time between sessions
+                    sessions.sort(key=lambda x: x['start_time'])
+                    time_diffs = []
+                    
+                    for i in range(1, len(sessions)):
+                        diff = sessions[i]['start_time'] - sessions[i-1]['start_time']
+                        time_diffs.append(diff.total_seconds() / 3600)  # Convert to hours
+                    
+                    if time_diffs:
+                        avg_hours = sum(time_diffs) / len(time_diffs)
+                        
+                        if self.verbose:
+                            print(f"[DEBUG] Detected average backup frequency: {avg_hours:.1f} hours")
+                        
+                        # Return 3x the average frequency to ensure we catch enough runs
+                        if avg_hours <= 2:
+                            return 8   # Very frequent backups (every 2 hours)
+                        elif avg_hours <= 4:
+                            return 12  # Every 2-4 hours  
+                        elif avg_hours <= 8:
+                            return 24  # Multiple times per day
+                        elif avg_hours <= 30:
+                            return 72  # Daily-ish, search 3 days
+                        else:
+                            return 240  # Weekly or less frequent, search 10 days
+            
+            except Exception as e:
+                if self.verbose:
+                    print(f"[DEBUG] Could not analyze backup frequency from logs: {e}")
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"[DEBUG] Could not detect backup frequency from timers: {e}")
+        
+        # Default fallback: Based on your timer (every 2 hours), search 6 hours to get ~3 runs
+        if self.verbose:
+            print(f"[DEBUG] Using default frequency detection: 6 hours")
+        return 6
+
+def main():
+    # Parse command line arguments for verbose mode
+    verbose = False
+    if "--verbose" in sys.argv or "-v" in sys.argv:
+        verbose = True
+        # Remove verbose flags from sys.argv so other argument parsing works
+        sys.argv = [arg for arg in sys.argv if arg not in ["--verbose", "-v"]]
+    
+    collector = BackupMetricsCollector(verbose=verbose)
+    
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--last-run":
+            # Parse --last-run options
+            run_offset = 0  # Default to last run (0th from end)
+            number_of_runs = 1  # Default to 1 run
+            filter_host = None
+            hours = None  # Will be auto-detected if not specified
+            
+            # Parse additional arguments
+            i = 2
+            while i < len(sys.argv):
+                arg = sys.argv[i]
+                
+                if arg.startswith("-") and arg[1:].isdigit():
+                    # Handle negative numbers like --last-run -4
+                    run_offset = abs(int(arg))
+                elif arg == "--count" and i + 1 < len(sys.argv):
+                    try:
+                        number_of_runs = int(sys.argv[i + 1])
+                        i += 1  # Skip the next argument as it's the number
+                    except ValueError:
+                        print(f"Error: Invalid number '{sys.argv[i + 1]}' for --count option")
+                        sys.exit(1)
+                elif arg == "--host" and i + 1 < len(sys.argv):
+                    filter_host = sys.argv[i + 1]
+                    i += 1  # Skip the next argument as it's the hostname
+                elif arg == "--hours" and i + 1 < len(sys.argv):
+                    try:
+                        hours = int(sys.argv[i + 1])
+                        i += 1  # Skip the next argument as it's the hours
+                    except ValueError:
+                        print(f"Error: Invalid hours '{sys.argv[i + 1]}' for --hours option")
+                        sys.exit(1)
+                else:
+                    print(f"Error: Unknown argument '{arg}' for --last-run")
+                    print("Usage: --last-run [-N] [--count N] [--host HOSTNAME] [--hours N]")
+                    sys.exit(1)
+                
+                i += 1
+            
+            # Auto-detect hours if not specified
+            if hours is None:
+                hours = collector._detect_backup_frequency()
+                if verbose:
+                    print(f"Auto-detected backup frequency: searching last {hours} hours")
+            
+            # Validate arguments
+            if run_offset < 0:
+                print("Error: Run offset cannot be negative")
+                sys.exit(1)
+            
+            if number_of_runs < 1:
+                print("Error: Number of runs must be at least 1")
+                sys.exit(1)
+            
+            # Print the requested backup runs
+            collector.print_last_runs(run_offset, number_of_runs, filter_host, hours)
+            sys.exit(0)
+            
+        elif sys.argv[1] == "--send-influxdb":
+            # Start background scan but don't wait for it
+            collector.start_background_directory_scan()
+            
+            # Send immediate metrics with what we have
+            success = collector.send_to_influxdb()
+            
+            print("Background directory scan continues in background")
+            print("Individual host metrics will be updated to InfluxDB as scan progresses")
+            
+            sys.exit(0 if success else 1)
+            
+        elif sys.argv[1] == "--send-influxdb-wait":
+            # Start background scan and wait for completion
+            collector.start_background_directory_scan()
+            
+            print("Waiting for background directory scan to complete...")
+            if collector.du_thread:
+                collector.du_thread.join()
+            
+            success = collector.send_to_influxdb()
+            sys.exit(0 if success else 1)
+            
+        elif sys.argv[1] == "--test-influxdb":
+            # Test InfluxDB connection only
+            success = collector.test_influxdb_connection()
+            sys.exit(0 if success else 1)
+            
+        elif sys.argv[1] == "--query-data":
+            # Query and display existing data from InfluxDB
+            hours = 24
+            if len(sys.argv) > 2:
+                try:
+                    hours = int(sys.argv[2])
+                except ValueError:
+                    print("Invalid hours parameter, using default 24 hours")
+            success = collector.query_influxdb_data(hours)
+            sys.exit(0 if success else 1)
+            
+        elif sys.argv[1] == "--delete-data":
+            # Delete all backup data from InfluxDB - for development use only
+            success = collector.delete_all_backup_data()
+            sys.exit(0 if success else 1)
+            
+        elif sys.argv[1] == "--json":
+            collector.start_background_directory_scan()
+            metrics = collector.generate_metrics_fast()
+            print(json.dumps(metrics, indent=2, default=lambda x: x.isoformat() if isinstance(x, datetime) else str(x)))
+            
+        elif sys.argv[1] == "--json-wait":
+            # Start background scan and wait for completion, then output JSON
+            collector.start_background_directory_scan()
+            
+            print("Waiting for background directory scan to complete...")
+            if collector.du_thread:
+                collector.du_thread.join()
+            
+            metrics = collector.generate_metrics_fast()
+            print(json.dumps(metrics, indent=2, default=lambda x: x.isoformat() if isinstance(x, datetime) else str(x)))
+            
+        elif sys.argv[1] == "--start-background-scan":
+            # Just start background scan and exit
+            collector.start_background_directory_scan()
+            print("Background scan started. Use --send-influxdb to send current metrics.")
+            return
+            
+        elif sys.argv[1] == "--help":
+            print("Usage: backup-metrics [OPTIONS]")
+            print("Options:")
+            print("  --last-run [-N] [--count N] [--host HOST] [--hours N]")
+            print("                        Show backup run logs")
+            print("                        -N: Show Nth run from end (e.g. -4 = 5th last run)")
+            print("                        --count N: Show N runs (default: 1)")
+            print("                        --host HOST: Filter logs for specific host")
+            print("                        --hours N: Search last N hours (auto-detected if not specified)")
+            print("  --send-influxdb       Send metrics to InfluxDB immediately (background scan continues)")
+            print("  --send-influxdb-wait  Send metrics to InfluxDB after directory scan completes")
+            print("  --test-influxdb       Test InfluxDB connection and authentication")
+            print("  --query-data [hours]  Query and display existing data from InfluxDB (default: 24 hours)")
+            print("  --delete-data         🗑️  DELETE ALL backup data from InfluxDB (DEVELOPMENT ONLY)")
+            print("  --json               Write JSON metrics (background scan continues)")
+            print("  --json-wait          Write JSON metrics after directory scan completes")
+            print("  --start-background-scan  Start background directory scan only")
+            print("  --verbose, -v        Enable verbose debugging output")
+            print("  --help               Show this help message")
+            print("")
+            print("Auto-detection of backup frequency:")
+            print("  The script automatically detects how often backups run by:")
+            print("  1. Checking systemctl list-timers for backup.timer")
+            print("  2. Analyzing recent backup run intervals from logs")
+            print("  3. Defaulting to 18 hours (assumes 4 backups/day)")
+            print("")
+            print("Examples:")
+            print("  backup-metrics --last-run                       # Show last backup run (auto-detect time range)")
+            print("  backup-metrics --last-run -2                    # Show 3rd last backup run")
+            print("  backup-metrics --last-run --count 3             # Show last 3 backup runs")
+            print("  backup-metrics --last-run --host bigbox         # Show last run for bigbox only")
+            print("  backup-metrics --last-run --hours 48            # Search last 48 hours explicitly")
+            print("  backup-metrics --last-run -4 --count 4 --host bigbox")
+            print("                                                   # Show 4 runs starting from 5th last, bigbox only")
+            sys.exit(0)
+    else:
+        # Default: start background scan and output current JSON
+        collector.start_background_directory_scan()
+        metrics = collector.generate_metrics_fast()
+        print(json.dumps(metrics, indent=2, default=lambda x: x.isoformat() if isinstance(x, datetime) else str(x)))
+
+
+if __name__ == "__main__":
+    main()

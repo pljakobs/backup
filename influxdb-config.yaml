@@ -1,0 +1,39 @@
+# InfluxDB Configuration for Backup Metrics
+# This file contains connection details for your existing InfluxDB instance
+
+influxdb:
+  # Your existing InfluxDB server details
+  host: "your-influxdb-server.example.com"  # Replace with your InfluxDB server hostname/IP
+  port: 8086                                # Default InfluxDB port
+  ssl: false                                # Set to true if using HTTPS
+  
+  # InfluxDB 1.x Authentication (username/password)
+  # Use these settings for InfluxDB 1.x
+  database: "backup_metrics"                # Database name for backup metrics
+  username: ""                              # InfluxDB username (leave empty if no auth)
+  password: ""                              # InfluxDB password (leave empty if no auth)
+  
+  # InfluxDB 2.x Authentication (token-based)
+  # Use these settings for InfluxDB 2.x (takes precedence if token is provided)
+  organization: ""                          # InfluxDB 2.x organization name
+  bucket: "backup-metrics"                  # InfluxDB 2.x bucket name
+  token: ""                                 # InfluxDB 2.x authentication token
+  
+  # Note: The script automatically detects InfluxDB version based on configuration:
+  # - If 'token' and 'organization' are provided, uses InfluxDB 2.x API
+  # - Otherwise, uses InfluxDB 1.x API with username/password or no auth
+
+# Grafana configuration (optional - if you want to automatically configure Grafana)
+grafana:
+  # Your existing Grafana instance details
+  host: "your-grafana-server.example.com"  # Replace with your Grafana server hostname/IP
+  port: 3000                                # Default Grafana port
+  admin_user: "admin"                       # Grafana admin username
+  admin_password: "admin"                   # Grafana admin password
+  ssl: false                                # Set to true if using HTTPS
+
+# Metrics collection settings
+metrics:
+  collection_interval: 300                  # Seconds between metric collections (5 minutes)
+  retention_hours: 168                      # Hours of log history to parse (7 days)
+  systemd_service: "backup.service"         # Name of your backup systemd service

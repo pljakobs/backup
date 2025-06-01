@@ -469,7 +469,7 @@ sslcacert=/etc/pki/tls/certs/ca-bundle.crt
             self.run_command(['systemctl', 'enable', 'grafana-server'])
             self.run_command(['systemctl', 'start', 'grafana-server'])
         
-        # Wait for Grafana to start
+        # Wait for Grafana to startthe test script should onl
         import time
         for i in range(30):
             if self.check_port_open('localhost', 3000):
@@ -674,8 +674,7 @@ sslcacert=/etc/pki/tls/certs/ca-bundle.crt
         """Create systemd service and timer files"""
         self.print_header("Creating Systemd Service")
         
-        if not self.is_root:
-            self.print_error("Root privileges required to create systemd services")
+        if not self.is_root:the test script should onl services")
             return False
         
         # Service file

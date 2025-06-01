@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash 
 #uses job pool from 
 # https://github.com/vincetse/shellutils/blob/master/job_pool.sh
 
@@ -6,7 +6,7 @@
 #. /etc/backup/options
 
 # Function to find configuration file in search paths
-find_config_file() {
+function find_config_file() {
     local filename="$1"
     local search_paths=(
         "./${filename}"
@@ -24,12 +24,50 @@ find_config_file() {
     echo "/etc/backup/${filename}"
 }
 
+function get_config_value() {
+    local key="$1"
+    local default="$2"
+    
+    local value
+    value=$(yq eval ".$key // \"$default\"" "$CONFIG_FILE")
+    echo "$value"
+}
+
+# Function to check if a path is on a BTRFS filesystem
+function is_btrfs_filesystem() {
+    local path="$1"
+    
+    # Check if the path exists
+    if [[ ! -e "$path" ]]; then
+        return 1
+    fi
+    
+    # Get the filesystem type using stat and /proc/mounts
+    local mount_point
+    mount_point=$(df "$path" | tail -1 | awk '{print $6}')
+    
+    # Check if the mount point is BTRFS
+    if grep -q "^[^ ]* $mount_point btrfs " /proc/mounts 2>/dev/null; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Function to check if btrfs-snp is available
+function is_btrfs_snp_available() {
+    command -v btrfs-snp >/dev/null 2>&1 || [[ -f "/usr/local/sbin/btrfs-snp" ]]
+}
+
 # Configuration file paths with search order
 CONFIG_FILE=$(find_config_file "backup.yaml")
 SCRIPTS_DIR="/etc/backup/scripts"
 
 # Global dry-run flag
 DRY_RUN=false
+
+# Global run ID for this backup session
+RUN_ID=""
 
 # Default rsync options
 rsyncOptions="-avz --stats --human-readable --progress --delete"
@@ -71,6 +109,31 @@ print_command() {
 
 print_dry_run() {
     echo -e "${PURPLE}[DRY-RUN]${NC} $1"
+}
+
+# Generate unique run ID based on high-resolution timestamp
+generate_run_id() {
+    # Use nanoseconds since epoch for maximum uniqueness
+    if command -v date >/dev/null 2>&1; then
+        # Try to get nanoseconds (GNU date)
+        if date +%s%N >/dev/null 2>&1; then
+            RUN_ID=$(date +%s%N)
+        else
+            # Fallback to microseconds (macOS/BSD date)
+            RUN_ID=$(date +%s000000)
+        fi
+    else
+        # Ultimate fallback using seconds + random number
+        RUN_ID="$(date +%s)$(shuf -i 100000-999999 -n 1)"
+    fi
+    echo "BACKUP_RUN_START: run_id=$RUN_ID timestamp=$(date '+%Y-%m-%d %H:%M:%S') script_version=backup-new.sh" >&2
+}
+
+# Log a message with run ID
+log_with_run_id() {
+    local level="$1"
+    local message="$2"
+    echo "BACKUP_LOG: run_id=$RUN_ID level=$level message=\"$message\" timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
 }
 
 # Execute command or show dry-run
@@ -462,8 +525,11 @@ function backup_host() {
         fi
         
         if [[ -n "$ssh_key" && "$ssh_key" != "null" && "$ssh_key" != '""' && -n "$ssh_user" ]]; then
-            # Add SSH options to handle problematic shells (like fish)
-            rsync_cmd="$rsync_cmd -e \"ssh -i $ssh_key -o LogLevel=ERROR -o BatchMode=yes\""
+            # Get SSH port for this host
+            local ssh_port=$(get_host_config "$hostname" "ssh_port" "22")
+            
+            # Add SSH options to handle problematic shells (like fish) and custom port
+            rsync_cmd="$rsync_cmd -e \"ssh -i $ssh_key -p $ssh_port -o LogLevel=ERROR -o BatchMode=yes\""
         fi
         
         if [[ -n "$path_options" && "$path_options" != "null" ]]; then
@@ -512,11 +578,12 @@ function backup_host() {
             fi
             
             # Log enhanced rsync statistics for metrics collection
-            echo "RSYNC_STATS: host=$hostname path=$path bytes_sent=$bytes_sent bytes_received=$bytes_received transfer_rate=$transfer_rate total_size=$total_size speedup=$speedup exit_code=$rsync_exit_code error_count=$error_count warning_count=$warning_count permission_errors=$permission_errors connection_errors=$connection_errors timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >> /var/log/backup-stats.log
+            local stats_log_file="${BACKUP_STATS_LOG:-/var/log/backup-stats.log}"
+            echo "RSYNC_STATS: run_id=$RUN_ID host=$hostname path=$path bytes_sent=$bytes_sent bytes_received=$bytes_received transfer_rate=$transfer_rate total_size=$total_size speedup=$speedup exit_code=$rsync_exit_code error_count=$error_count warning_count=$warning_count permission_errors=$permission_errors connection_errors=$connection_errors timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >> "$stats_log_file"
             
             # Log detailed error messages if any exist
             if [[ -n "$error_messages" ]]; then
-                echo "RSYNC_ERRORS: host=$hostname path=$path messages=\"$error_messages\" timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >> /var/log/backup-stats.log
+                echo "RSYNC_ERRORS: run_id=$RUN_ID host=$hostname path=$path messages=\"$error_messages\" timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >> "$stats_log_file"
             fi
             
             # Clean up temporary file
@@ -545,7 +612,7 @@ function backup_host() {
                     print_warning "Volume backup completed with warnings: $hostname:$path (exit code: $rsync_exit_code)"
                     # Log specific error for metrics collection
                     if [[ $error_count -gt 0 ]]; then
-                        echo "BACKUP_ERROR: host=$hostname path=$path error_count=$error_count exit_code=$rsync_exit_code timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
+                        echo "BACKUP_ERROR: run_id=$RUN_ID host=$hostname path=$path error_count=$error_count exit_code=$rsync_exit_code timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
                     fi
                     # Don't fail the host for warnings, but track it
                     if [[ "$BACKUP_STATUS_HOST" == "success" ]]; then
@@ -555,7 +622,7 @@ function backup_host() {
                 "failed")
                     print_error "Volume backup failed: $hostname:$path (exit code: $rsync_exit_code)"
                     # Log specific error for metrics collection
-                    echo "BACKUP_ERROR: host=$hostname path=$path error_count=$error_count exit_code=$rsync_exit_code timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
+                    echo "BACKUP_ERROR: run_id=$RUN_ID host=$hostname path=$path error_count=$error_count exit_code=$rsync_exit_code timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
                     BACKUP_STATUS_HOST="failed"
                     BACKUP_STATUS_OVERALL="failed"
                     ;;
@@ -597,6 +664,9 @@ function verify_host_connectivity() {
     
     print_info "Verifying connectivity to $hostname..."
     
+    # Get SSH port for this host
+    local ssh_port=$(get_host_config "$hostname" "ssh_port" "22")
+    
     # In dry-run mode, just simulate the verification
     if [[ "$DRY_RUN" == "true" ]]; then
         if [[ "$ignore_ping" != "true" ]]; then
@@ -610,7 +680,7 @@ function verify_host_connectivity() {
             if [[ -n "$ssh_key" && "$ssh_key" != "null" && "$ssh_key" != '""' ]]; then
                 ssh_cmd="$ssh_cmd -i $ssh_key"
             fi
-            ssh_cmd="$ssh_cmd -o ConnectTimeout=10 -o BatchMode=yes"
+            ssh_cmd="$ssh_cmd -p $ssh_port -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no"
             print_dry_run "$ssh_cmd $ssh_user \"echo 'Connection successful'\""
         else
             print_info "Local backup - no SSH verification needed"
@@ -644,12 +714,12 @@ function verify_host_connectivity() {
         return 0
     fi
     
-    # Build SSH command
+    # Build SSH command with port support
     local ssh_cmd="ssh"
     if [[ -n "$ssh_key" && "$ssh_key" != "null" && "$ssh_key" != '""' ]]; then
         ssh_cmd="$ssh_cmd -i $ssh_key"
     fi
-    ssh_cmd="$ssh_cmd -o ConnectTimeout=10 -o BatchMode=yes"
+    ssh_cmd="$ssh_cmd -p $ssh_port -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no"
     
     print_command "$ssh_cmd $ssh_user \"echo 'Connection successful'\""
     
@@ -666,7 +736,7 @@ function verify_host_connectivity() {
             read -n 1 -r
             echo
             if [[ $REPLY =~ ^[Yy]$ ]]; then
-                setup_ssh_key "$ssh_user" "$ssh_key"
+                setup_ssh_key "$ssh_user" "$ssh_key" "$ssh_port"
                 return $?
             else
                 return 1
@@ -681,8 +751,9 @@ function verify_host_connectivity() {
 function setup_ssh_key() {
     local ssh_user="$1"
     local ssh_key="$2"
+    local ssh_port="${3:-22}"
     
-    print_info "Setting up SSH key for $ssh_user..."
+    print_info "Setting up SSH key for $ssh_user (port $ssh_port)..."
     
     # Check if key exists
     if [[ ! -f "$ssh_key" ]]; then
@@ -691,14 +762,15 @@ function setup_ssh_key() {
         ssh-keygen -t ed25519 -f "$ssh_key" -N ""
     fi
     
-    # Copy key to remote host
+    # Copy key to remote host with port support
     print_info "Copying SSH key to remote host..."
-    print_command "ssh-copy-id -i \"$ssh_key\" \"$ssh_user\""
-    ssh-copy-id -i "$ssh_key" "$ssh_user"
+    print_command "ssh-copy-id -i \"$ssh_key\" -p \"$ssh_port\" \"$ssh_user\""
+    ssh-copy-id -i "$ssh_key" -p "$ssh_port" "$ssh_user"
     
-    # Verify connection again
+    # Verify connection again with port support
     print_info "Verifying SSH key setup..."
-    if ssh -i "$ssh_key" -o ConnectTimeout=10 -o BatchMode=yes "$ssh_user" "echo 'Key setup successful'" &>/dev/null; then
+    # Verify SSH key setup
+    if ssh -i "$ssh_key" -p "$ssh_port" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no "$ssh_user" "echo 'Key setup successful'" &>/dev/null; then
         print_success "SSH key setup successful for $ssh_user"
         return 0
     else
@@ -771,6 +843,18 @@ function create_snapshots() {
     
     print_header "Creating BTRFS Snapshots"
     
+    # Check if the snapshot volume is on a BTRFS filesystem
+    if ! is_btrfs_filesystem "$snapshot_volume"; then
+        print_warning "Snapshot volume $snapshot_volume is not on a BTRFS filesystem, skipping snapshots"
+        return 0
+    fi
+    
+    # Check if btrfs-snp is available
+    if ! is_btrfs_snp_available; then
+        print_warning "btrfs-snp is not available, skipping snapshots"
+        return 0
+    fi
+    
     if [[ "$schedules_count" == "0" || "$schedules_count" == "null" ]]; then
         print_warning "No snapshot schedules configured, using defaults..."
         # Use original values as fallback
@@ -832,6 +916,10 @@ run_backup() {
         print_info "This will execute actual backup operations"
         echo
     fi
+    
+    # Generate unique run ID for this backup session
+    generate_run_id
+    print_info "Generated run ID: $RUN_ID"
     
     check_dependencies
     
@@ -898,10 +986,13 @@ run_backup() {
         # Report final backup status
         if [[ "$BACKUP_STATUS_OVERALL" == "success" ]]; then
             print_success "Backup operations completed successfully"
+            echo "BACKUP_RUN_COMPLETE: run_id=$RUN_ID status=success timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
         elif [[ "$BACKUP_STATUS_OVERALL" == "warning" ]]; then
             print_warning "Backup operations completed with warnings"
+            echo "BACKUP_RUN_COMPLETE: run_id=$RUN_ID status=warning timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
         else
             print_error "Backup operations completed with failures"
+            echo "BACKUP_RUN_COMPLETE: run_id=$RUN_ID status=failed timestamp=$(date '+%Y-%m-%d %H:%M:%S')" >&2
             exit 1
         fi
     fi

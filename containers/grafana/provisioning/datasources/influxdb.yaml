@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB-Backup
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    database: backup-metrics
+    user: admin
+    secureJsonData:
+      token: backup-test-token
+    jsonData:
+      version: Flux
+      organization: backup-org
+      defaultBucket: backup-metrics
+      tlsSkipVerify: true
+    isDefault: true

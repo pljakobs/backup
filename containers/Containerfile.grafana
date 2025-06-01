@@ -1,0 +1,25 @@
+# Grafana container for metrics visualization
+FROM docker.io/grafana/grafana:10.2.3
+
+# Environment variables
+ENV GF_SECURITY_ADMIN_PASSWORD=backup-grafana-password
+ENV GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+
+# Copy provisioning files
+COPY containers/grafana/provisioning /etc/grafana/provisioning
+COPY containers/grafana/dashboards /var/lib/grafana/dashboards
+
+# Create grafana user with proper permissions
+USER root
+RUN mkdir -p /var/lib/grafana/dashboards && \
+    chown -R 472:472 /var/lib/grafana/dashboards /etc/grafana/provisioning
+
+# Switch back to grafana user
+USER grafana
+
+# Expose Grafana port
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:3000/api/health || exit 1

@@ -1,0 +1,87 @@
+# Client container - simulates backup source
+FROM registry.fedoraproject.org/fedora:42
+
+# Install required packages
+RUN dnf update -y && \
+    dnf install -y \
+        bash \
+        openssh-server \
+        openssh-clients \
+        coreutils \
+        findutils \
+        util-linux \
+        rsync \
+        python3 \
+        curl \
+        vim-minimal \
+        yq \
+    && dnf clean all
+
+# Create test user and setup SSH
+RUN useradd -m -s /bin/bash testuser && \
+    mkdir -p /home/testuser/.ssh && \
+    chown testuser:testuser /home/testuser/.ssh && \
+    chmod 700 /home/testuser/.ssh
+
+# Setup SSH daemon
+RUN ssh-keygen -A && \
+    mkdir -p /var/run/sshd
+
+# Create test data structure
+RUN mkdir -p /home/testuser/data/{documents,photos,config} && \
+    echo "Important document 1" > /home/testuser/data/documents/doc1.txt && \
+    echo "Important document 2" > /home/testuser/data/documents/doc2.txt && \
+    echo "Photo metadata" > /home/testuser/data/photos/photo1.jpg && \
+    echo "Config file content" > /home/testuser/data/config/app.conf && \
+    echo "Client hostname" > /etc/hostname && \
+    chown -R testuser:testuser /home/testuser/data
+
+# Setup authorized_keys (will be populated by backup container)
+RUN touch /home/testuser/.ssh/authorized_keys && \
+    chown testuser:testuser /home/testuser/.ssh/authorized_keys && \
+    chmod 600 /home/testuser/.ssh/authorized_keys
+
+# Create script to add backup key
+COPY containers/scripts/setup-ssh-key.sh /usr/local/bin/
+COPY generate-test-data.py /usr/local/bin/
+RUN chmod +x /usr/local/bin/setup-ssh-key.sh /usr/local/bin/generate-test-data.py
+
+# Create startup script that waits for SSH key and starts sshd
+RUN echo '#!/bin/bash' > /usr/local/bin/start-client.sh && \
+    echo 'echo "Starting client container..."' >> /usr/local/bin/start-client.sh && \
+    echo '' >> /usr/local/bin/start-client.sh && \
+    echo '# Generate client-specific test data' >> /usr/local/bin/start-client.sh && \
+    echo 'if [ -n "$CLIENT_ID" ]; then' >> /usr/local/bin/start-client.sh && \
+    echo '    echo "Generating test data for client $CLIENT_ID..."' >> /usr/local/bin/start-client.sh && \
+    echo '    python3 /usr/local/bin/generate-test-data.py --client-id $CLIENT_ID --data-size medium --mode filesystem' >> /usr/local/bin/start-client.sh && \
+    echo 'fi' >> /usr/local/bin/start-client.sh && \
+    echo '' >> /usr/local/bin/start-client.sh && \
+    echo '# Wait for backup public key to be available' >> /usr/local/bin/start-client.sh && \
+    echo 'echo "Waiting for backup SSH public key..."' >> /usr/local/bin/start-client.sh && \
+    echo 'for i in {1..30}; do' >> /usr/local/bin/start-client.sh && \
+    echo '    if [ -f "/shared/ssh-keys/backup_key.pub" ]; then' >> /usr/local/bin/start-client.sh && \
+    echo '        echo "Found backup public key, setting up SSH access..."' >> /usr/local/bin/start-client.sh && \
+    echo '        cat /shared/ssh-keys/backup_key.pub >> /home/testuser/.ssh/authorized_keys' >> /usr/local/bin/start-client.sh && \
+    echo '        chown testuser:testuser /home/testuser/.ssh/authorized_keys' >> /usr/local/bin/start-client.sh && \
+    echo '        chmod 600 /home/testuser/.ssh/authorized_keys' >> /usr/local/bin/start-client.sh && \
+    echo '        echo "SSH key authentication set up successfully"' >> /usr/local/bin/start-client.sh && \
+    echo '        break' >> /usr/local/bin/start-client.sh && \
+    echo '    fi' >> /usr/local/bin/start-client.sh && \
+    echo '    echo "Attempt $i: SSH key not found, waiting..."' >> /usr/local/bin/start-client.sh && \
+    echo '    sleep 2' >> /usr/local/bin/start-client.sh && \
+    echo 'done' >> /usr/local/bin/start-client.sh && \
+    echo '' >> /usr/local/bin/start-client.sh && \
+    echo '# Start SSH daemon' >> /usr/local/bin/start-client.sh && \
+    echo 'echo "Starting SSH daemon..."' >> /usr/local/bin/start-client.sh && \
+    echo 'exec /usr/sbin/sshd -D -e' >> /usr/local/bin/start-client.sh && \
+    chmod +x /usr/local/bin/start-client.sh
+
+# Expose SSH port
+EXPOSE 22
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD pgrep sshd || exit 1
+
+# Start with our custom startup script
+CMD ["/usr/local/bin/start-client.sh"]

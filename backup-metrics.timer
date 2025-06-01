@@ -1,0 +1,13 @@
+[Unit]
+Description=Optional periodic backup metrics collection
+# Note: Metrics are automatically collected after each backup.service run
+# This timer provides optional additional periodic collection if desired.
+Requires=backup-metrics.service
+
+[Timer]
+# Uncomment the next two lines for optional periodic metrics collection
+# OnCalendar=daily
+# Persistent=true
+
+[Install]
+# WantedBy=timers.target  # Uncomment to enable periodic collection

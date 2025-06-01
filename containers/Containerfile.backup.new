@@ -1,0 +1,121 @@
+FROM registry.fedoraproject.org/fedora:42
+
+# Install required packages
+RUN dnf update -y && \
+    dnf install -y \
+        bash \
+        rsync \
+        openssh-clients \
+        python3 \
+        python3-pip \
+        systemd \
+        util-linux \
+        procps-ng \
+        findutils \
+        coreutils \
+        curl \
+        jq \
+        vim-minimal \
+        nc \
+        btrfs-progs \
+        golang \
+        wget \
+        bc \
+        stress \
+        time \
+        htop \
+        iotop \
+        sysstat \
+        iputils \
+        which \
+    && dnf clean all
+
+# Install yq (YAML processor)
+RUN curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && \
+    chmod +x /usr/local/bin/yq
+
+# Install btrfs-snp
+RUN mkdir -p /usr/local/sbin && \
+    curl -o /usr/local/sbin/btrfs-snp https://raw.githubusercontent.com/nachoparker/btrfs-snp/refs/heads/master/btrfs-snp && \
+    chmod +x /usr/local/sbin/btrfs-snp
+
+# Install job_pool.sh
+RUN curl -o /usr/local/bin/job_pool.sh https://raw.githubusercontent.com/vincetse/shellutils/master/job_pool.sh && \
+    chmod +x /usr/local/bin/job_pool.sh
+
+# Install Python dependencies
+RUN pip3 install influxdb-client pyyaml requests psutil
+
+# Create backup user and directories
+RUN useradd -m -s /bin/bash backup && \
+    mkdir -p /opt/backup /etc/backup /var/log/backup /var/lib/backup /etc/backup/ssh_keys && \
+    chown -R backup:backup /opt/backup /etc/backup /var/log/backup /var/lib/backup
+
+# Copy backup scripts
+COPY backup-new.sh backup-metrics /opt/backup/
+COPY job_pool.sh /opt/backup/
+COPY rm-all.sh setup-influxdb.sh setup-monitoring.sh /opt/backup/
+COPY setup-centralized-influxdb.sh /opt/backup/
+COPY tests/ /opt/backup/tests/
+COPY containers/test-container.sh /opt/backup/
+COPY generate-test-data.py /opt/backup/
+COPY containers/backup-multi.yaml /opt/backup
+
+RUN chmod +x /opt/backup/backup-new.sh /opt/backup/backup-metrics /opt/backup/job_pool.sh \
+    /opt/backup/rm-all.sh /opt/backup/setup-influxdb.sh /opt/backup/setup-monitoring.sh \
+    /opt/backup/setup-centralized-influxdb.sh /opt/backup/tests/*.sh /opt/backup/test-container.sh
+
+# Use multi-client configuration as default
+RUN cp /opt/backup/backup-multi.yaml /etc/backup/backup.yaml
+
+# Create InfluxDB configuration
+RUN echo 'influxdb:' > /etc/backup/influxdb-config.yaml && \
+    echo '  url: "http://influxdb:8086"' >> /etc/backup/influxdb-config.yaml && \
+    echo '  token: "backup-test-token"' >> /etc/backup/influxdb-config.yaml && \
+    echo '  org: "backup-org"' >> /etc/backup/influxdb-config.yaml && \
+    echo '  bucket: "backup-metrics"' >> /etc/backup/influxdb-config.yaml && \
+    echo '' >> /etc/backup/influxdb-config.yaml && \
+    echo 'systemd:' >> /etc/backup/influxdb-config.yaml && \
+    echo '  service_name: "backup"' >> /etc/backup/influxdb-config.yaml && \
+    echo '  journal_identifier: "backup"' >> /etc/backup/influxdb-config.yaml
+
+# Generate SSH key
+RUN ssh-keygen -t rsa -b 2048 -f /etc/backup/ssh_keys/backup_key -N "" && \
+    chown -R backup:backup /etc/backup/ssh_keys
+
+# Create startup script that copies SSH key to shared volume
+RUN echo '#!/bin/bash' > /opt/backup/start-backup.sh && \
+    echo 'echo "Starting backup container..."' >> /opt/backup/start-backup.sh && \
+    echo '' >> /opt/backup/start-backup.sh && \
+    echo '# Copy SSH public key to shared volume for client containers' >> /opt/backup/start-backup.sh && \
+    echo 'if [ -f "/etc/backup/ssh_keys/backup_key.pub" ]; then' >> /opt/backup/start-backup.sh && \
+    echo '    echo "Copying SSH public key to shared volume..."' >> /opt/backup/start-backup.sh && \
+    echo '    mkdir -p /shared/ssh-keys' >> /opt/backup/start-backup.sh && \
+    echo '    cp /etc/backup/ssh_keys/backup_key.pub /shared/ssh-keys/backup_key.pub' >> /opt/backup/start-backup.sh && \
+    echo '    cp /etc/backup/ssh_keys/backup_key /shared/ssh-keys/backup_key' >> /opt/backup/start-backup.sh && \
+    echo '    chmod 644 /shared/ssh-keys/backup_key.pub' >> /opt/backup/start-backup.sh && \
+    echo '    chmod 600 /shared/ssh-keys/backup_key' >> /opt/backup/start-backup.sh && \
+    echo '    chown backup:backup /shared/ssh-keys/backup_key*' >> /opt/backup/start-backup.sh && \
+    echo '    echo "SSH key copied successfully"' >> /opt/backup/start-backup.sh && \
+    echo 'else' >> /opt/backup/start-backup.sh && \
+    echo '    echo "ERROR: SSH key not found at /etc/backup/ssh_keys/backup_key.pub"' >> /opt/backup/start-backup.sh && \
+    echo 'fi' >> /opt/backup/start-backup.sh && \
+    echo '' >> /opt/backup/start-backup.sh && \
+    echo '# Keep container running' >> /opt/backup/start-backup.sh && \
+    echo 'exec "$@"' >> /opt/backup/start-backup.sh && \
+    chmod +x /opt/backup/start-backup.sh
+
+# Create test runner
+RUN echo '#!/bin/bash' > /opt/backup/run-tests.sh && \
+    echo 'cd /opt/backup' >> /opt/backup/run-tests.sh && \
+    echo './test-container.sh' >> /opt/backup/run-tests.sh && \
+    chmod +x /opt/backup/run-tests.sh
+
+ENV PATH="/opt/backup:/usr/local/bin:${PATH}"
+WORKDIR /opt/backup
+USER backup
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD test -x /opt/backup/backup-new.sh || exit 1
+
+CMD ["/opt/backup/start-backup.sh", "/bin/bash", "-c", "while true; do sleep 30; done"]

@@ -1,0 +1,17 @@
+config:
+  backup_base: "/share/backup/"
+  rsync_options: "-avz --delete-after --ignore-errors"
+  lock_file: "/tmp/backup.fil"
+  # Global setting for ownership preservation
+  preserve_ownership: false  # Set to true to keep original ownership, false to normalize to root
+
+hosts:
+  lightinator:
+    hostname: "lightinator.de"
+    ssh_user: "pjakobs"
+    ssh_key: "/home/pjakobs/.ssh/id_ed25519"
+    # Per-host override for ownership preservation
+    paths:
+      - path: "/home/github-deploy"
+        # Per-path override
+        preserve_ownership: false

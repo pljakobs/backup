@@ -28,6 +28,8 @@ RUN dnf update -y && \
         sysstat \
         iputils \
         which \
+        gawk \
+        hostname \
     && dnf clean all
 
 # Install yq (YAML processor)
@@ -49,7 +51,9 @@ RUN pip3 install influxdb-client pyyaml requests psutil
 # Create backup user and directories
 RUN useradd -m -s /bin/bash backup && \
     mkdir -p /opt/backup /etc/backup /var/log/backup /var/lib/backup /etc/backup/ssh_keys && \
-    chown -R backup:backup /opt/backup /etc/backup /var/log/backup /var/lib/backup
+    chown -R backup:backup /opt/backup /etc/backup /var/log/backup /var/lib/backup && \
+    mkdir -p /share && \
+    chown -R backup:backup /share
 
 # Copy backup scripts
 COPY backup-new.sh backup-metrics /opt/backup/
@@ -87,16 +91,24 @@ RUN ssh-keygen -t rsa -b 2048 -f /etc/backup/ssh_keys/backup_key -N "" && \
 RUN echo '#!/bin/bash' > /opt/backup/start-backup.sh && \
     echo 'echo "Starting backup container..."' >> /opt/backup/start-backup.sh && \
     echo '' >> /opt/backup/start-backup.sh && \
-    echo '# Copy SSH public key to shared volume for client containers' >> /opt/backup/start-backup.sh && \
+    echo '# Copy SSH keys to both shared volume and backup user .ssh directory' >> /opt/backup/start-backup.sh && \
     echo 'if [ -f "/etc/backup/ssh_keys/backup_key.pub" ]; then' >> /opt/backup/start-backup.sh && \
-    echo '    echo "Copying SSH public key to shared volume..."' >> /opt/backup/start-backup.sh && \
+    echo '    echo "Copying SSH keys to shared volume..."' >> /opt/backup/start-backup.sh && \
     echo '    mkdir -p /shared/ssh-keys' >> /opt/backup/start-backup.sh && \
     echo '    cp /etc/backup/ssh_keys/backup_key.pub /shared/ssh-keys/backup_key.pub' >> /opt/backup/start-backup.sh && \
     echo '    cp /etc/backup/ssh_keys/backup_key /shared/ssh-keys/backup_key' >> /opt/backup/start-backup.sh && \
     echo '    chmod 644 /shared/ssh-keys/backup_key.pub' >> /opt/backup/start-backup.sh && \
     echo '    chmod 600 /shared/ssh-keys/backup_key' >> /opt/backup/start-backup.sh && \
     echo '    chown backup:backup /shared/ssh-keys/backup_key*' >> /opt/backup/start-backup.sh && \
-    echo '    echo "SSH key copied successfully"' >> /opt/backup/start-backup.sh && \
+    echo '' >> /opt/backup/start-backup.sh && \
+    echo '    echo "Copying SSH keys to backup user .ssh directory..."' >> /opt/backup/start-backup.sh && \
+    echo '    mkdir -p /home/backup/.ssh' >> /opt/backup/start-backup.sh && \
+    echo '    cp /etc/backup/ssh_keys/backup_key /home/backup/.ssh/id_rsa' >> /opt/backup/start-backup.sh && \
+    echo '    cp /etc/backup/ssh_keys/backup_key.pub /home/backup/.ssh/id_rsa.pub' >> /opt/backup/start-backup.sh && \
+    echo '    chmod 600 /home/backup/.ssh/id_rsa' >> /opt/backup/start-backup.sh && \
+    echo '    chmod 644 /home/backup/.ssh/id_rsa.pub' >> /opt/backup/start-backup.sh && \
+    echo '    chown -R backup:backup /home/backup/.ssh' >> /opt/backup/start-backup.sh && \
+    echo '    echo "SSH keys setup completed"' >> /opt/backup/start-backup.sh && \
     echo 'else' >> /opt/backup/start-backup.sh && \
     echo '    echo "ERROR: SSH key not found at /etc/backup/ssh_keys/backup_key.pub"' >> /opt/backup/start-backup.sh && \
     echo 'fi' >> /opt/backup/start-backup.sh && \

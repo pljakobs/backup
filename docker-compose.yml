@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   backup:
-    image: localhost/backup-system:latest
+    build:
+      context: .
+      dockerfile: containers/Containerfile.backup.new
     container_name: backup-test
     networks:
       - backup-network

@@ -5,45 +5,14 @@
 
 set -euo pipefail
 
+# Source common test library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/test_lib.sh"
+
 # Test configuration
 SCRIPT_NAME="test_connectivity.sh"
 BACKUP_CONTAINER="backup-test"
 BACKUP_SCRIPT="/opt/backup/backup-new.sh"
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Test counters
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-# Helper functions
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-log_success() {
-    echo -e "${GREEN}[PASS]${NC} $1"
-    ((TESTS_PASSED++))
-}
-
-log_error() {
-    echo -e "${RED}[FAIL]${NC} $1"
-    ((TESTS_FAILED++))
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-run_test() {
-    ((TESTS_RUN++))
-}
 
 # Main test functions
 test_container_running() {
@@ -123,7 +92,7 @@ test_verify_hosts() {
         if echo "$verify_output" | grep -q "Successfully connected to"; then
             local connected_hosts
             connected_hosts=$(echo "$verify_output" | grep "Successfully connected to" | wc -l)
-            log_success "Successfully connected to $connected_hosts host(s)"
+            print_info "Successfully connected to $connected_hosts host(s)"
         fi
         
         # Check for any failed connections
@@ -140,35 +109,37 @@ test_verify_hosts() {
 
 test_individual_client_connectivity() {
     log_info "Testing individual client container connectivity..."
+    run_test
     
     # Test connectivity to each expected client
     local clients=("backup-client1" "backup-client2" "backup-client3")
     local all_clients_reachable=true
     
     for client in "${clients[@]}"; do
-        run_test
         log_info "Testing connectivity to $client..."
         
         if podman ps --format "{{.Names}}" | grep -q "^${client}$"; then
-            log_success "Container '$client' is running"
+            print_info "Container '$client' is running"
             
             # Test network connectivity
             if podman exec "${BACKUP_CONTAINER}" ping -c 1 -W 2 "$client" >/dev/null 2>&1; then
-                log_success "Network connectivity to '$client' successful"
+                print_info "Network connectivity to '$client' successful"
             else
-                log_error "Network connectivity to '$client' failed"
+                print_info "Network connectivity to '$client' failed"
                 all_clients_reachable=false
             fi
         else
-            log_error "Container '$client' is not running"
+            print_info "Container '$client' is not running"
             all_clients_reachable=false
         fi
     done
     
     if $all_clients_reachable; then
         log_success "All expected client containers are reachable"
+        return 0
     else
         log_error "Some client containers are not reachable"
+        return 1
     fi
 }
 
@@ -180,6 +151,7 @@ main() {
     echo ""
     
     log_info "Starting connectivity tests for backup system..."
+[INFO] Test message
     echo ""
     
     # Run all tests
@@ -203,18 +175,13 @@ main() {
     echo "                           TEST SUMMARY                                "
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-    echo "Tests run: $TESTS_RUN"
-    echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
-    echo -e "Tests failed: ${RED}$TESTS_FAILED${NC}"
-    echo ""
     
-    if [[ $TESTS_FAILED -eq 0 ]]; then
-        log_success "All connectivity tests passed! ✅"
+    # Use library function for summary
+    if print_test_summary "$SCRIPT_NAME"; then
         echo ""
         log_info "The backup system is ready for multi-client backup operations."
         exit 0
     else
-        log_error "Some tests failed! ❌"
         echo ""
         log_info "Please check the failed tests above and resolve connectivity issues."
         exit 1

@@ -103,8 +103,8 @@ generate_backup_config() {
     local config_file="$SCRIPT_DIR/containers/backup-multi.yaml"
     
     cat > "$config_file" << EOF
-backup_base: "/var/lib/backup/data"
-lock_file: "/var/lib/backup/backup.lock"
+backup_base: "/share/backup"
+lock_file: "/tmp/backup.lock"
 rsync_options: "-avz --stats --delete"
 log_level: "INFO"
 parallel_jobs: $(($NUM_CLIENTS > 8 ? 8 : $NUM_CLIENTS))

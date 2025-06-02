@@ -7,53 +7,28 @@
 # It does NOT run actual backups or require complex configurations
 #
 
+set -euo pipefail
+
+# Source common test library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/test_lib.sh"
+
 # Test configuration
-BACKUP_SCRIPT="$(dirname "$(dirname "$(realpath "$0")")")/backup-new.sh"
-BACKUP_METRICS="$(dirname "$(dirname "$(realpath "$0")")")/backup-metrics"
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-# Global test counters
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-print_test_header() {
-    echo
-    echo -e "${BLUE}========================================${NC}"
-    echo -e "${BLUE} $1${NC}"
-    echo -e "${BLUE}========================================${NC}"
-}
-
-print_success() {
-    echo -e "${GREEN}[PASS]${NC} $1"
-    ((TESTS_PASSED++))
-}
-
-print_failure() {
-    echo -e "${RED}[FAIL]${NC} $1"
-    ((TESTS_FAILED++))
-}
-
-print_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
+BACKUP_SCRIPT="$(get_backup_script_path)"
+BACKUP_METRICS="$(get_metrics_script_path)"
 
 # Test run ID format by examining the generation method in the script
 test_runid_format() {
+    log_info "Testing Run ID format..."
+    run_test
+    
     print_test_header "Testing Run ID Format"
-    ((TESTS_RUN++))
     
     # Look for RUN_ID generation in the backup script
     local runid_line=$(grep -n "RUN_ID=" "$BACKUP_SCRIPT" | head -1)
     
     if [[ -z "$runid_line" ]]; then
-        print_failure "Could not find RUN_ID generation in backup script"
+        log_error "Could not find RUN_ID generation in backup script"
         return 1
     fi
     
@@ -62,9 +37,9 @@ test_runid_format() {
     
     # Check if it uses the expected format
     if echo "$line_content" | grep -q "time_"; then
-        print_success "Run ID uses expected time-based format"
+        log_success "Run ID uses expected time-based format"
     else
-        print_failure "Run ID format unexpected: $line_content"
+        log_error "Run ID format unexpected: $line_content"
         return 1
     fi
     
@@ -73,8 +48,10 @@ test_runid_format() {
 
 # Test that the backup script generates a run ID when run with --dry-run
 test_runid_generation() {
+    log_info "Testing Run ID generation with --dry-run..."
+    run_test
+    
     print_test_header "Testing Run ID Generation with --dry-run"
-    ((TESTS_RUN++))
     
     # Create minimal test environment
     local temp_config_dir="/tmp/runid-test-$$"
@@ -113,16 +90,16 @@ EOF
     local runid=$(echo "$output" | grep -o "Generated run ID: [^[:space:]]*" | sed 's/Generated run ID: //')
     
     if [[ -z "$runid" ]]; then
-        print_failure "No run ID generated in dry run"
+        log_error "No run ID generated in dry run"
         echo "Output sample: $(echo "$output" | head -5)"
         return 1
     fi
     
     # Test format (should be time_<timestamp>)
     if [[ "$runid" =~ ^time_[0-9]+$ ]]; then
-        print_success "Run ID generated with correct format: $runid"
+        log_success "Run ID generated with correct format: $runid"
     else
-        print_failure "Run ID format invalid: $runid"
+        log_error "Run ID format invalid: $runid"
         return 1
     fi
     
@@ -173,7 +150,7 @@ EOF
     rm -rf "$temp_config_dir"
     
     if [[ ${#runids[@]} -lt 3 ]]; then
-        print_failure "Could not generate 3 run IDs (got ${#runids[@]})"
+        log_error "Could not generate 3 run IDs (got ${#runids[@]})"
         return 1
     fi
     
@@ -181,9 +158,9 @@ EOF
     local unique_count=$(printf '%s\n' "${runids[@]}" | sort -u | wc -l)
     
     if [[ $unique_count -eq ${#runids[@]} ]]; then
-        print_success "All run IDs are unique: ${runids[*]}"
+        log_success "All run IDs are unique: ${runids[*]}"
     else
-        print_failure "Duplicate run IDs found: ${runids[*]}"
+        log_error "Duplicate run IDs found: ${runids[*]}"
         return 1
     fi
     
@@ -201,7 +178,7 @@ test_metrics_script() {
     local version_exit_code=$?
     
     if [[ $version_exit_code -ne 0 ]]; then
-        print_failure "Metrics script --version failed (exit code: $version_exit_code)"
+        log_error "Metrics script --version failed (exit code: $version_exit_code)"
         return 1
     fi
     
@@ -213,15 +190,15 @@ test_metrics_script() {
     local help_exit_code=$?
     
     if [[ $help_exit_code -ne 0 ]]; then
-        print_failure "Metrics script --help failed (exit code: $help_exit_code)"
+        log_error "Metrics script --help failed (exit code: $help_exit_code)"
         return 1
     fi
     
     # Check for expected options
     if echo "$help_output" | grep -q "\--last-run"; then
-        print_success "Metrics script has --last-run option"
+        log_success "Metrics script has --last-run option"
     else
-        print_failure "Metrics script missing --last-run option"
+        log_error "Metrics script missing --last-run option"
         return 1
     fi
     
@@ -239,25 +216,25 @@ test_metrics_last_run() {
     local exit_code=$?
     
     if [[ $exit_code -ne 0 ]]; then
-        print_failure "Metrics script --last-run failed (exit code: $exit_code)"
+        log_error "Metrics script --last-run failed (exit code: $exit_code)"
         echo "Output: $output"
         return 1
     fi
     
     # Check output
     if echo "$output" | grep -q "No recent backup runs found"; then
-        print_success "Metrics script reports no runs found (expected in test environment)"
+        log_success "Metrics script reports no runs found (expected in test environment)"
     elif echo "$output" | grep -q "BACKUP RUN"; then
-        print_success "Metrics script found backup runs from systemd logs"
+        log_success "Metrics script found backup runs from systemd logs"
         
         # Look for run ID patterns
         if echo "$output" | grep -qE "(time_[0-9]+|run_id=)"; then
-            print_success "Metrics script output contains run ID information"
+            log_success "Metrics script output contains run ID information"
         else
             print_info "Note: Metrics script output doesn't show run ID patterns (may be expected)"
         fi
     else
-        print_failure "Metrics script produced unexpected output"
+        log_error "Metrics script produced unexpected output"
         echo "Output: $output"
         return 1
     fi
@@ -275,24 +252,24 @@ test_runid_log_format() {
     local run_complete_pattern=$(grep -n "BACKUP_RUN_COMPLETE" "$BACKUP_METRICS" | head -1)
     
     if [[ -n "$run_start_pattern" ]]; then
-        print_success "Metrics script recognizes BACKUP_RUN_START pattern"
+        log_success "Metrics script recognizes BACKUP_RUN_START pattern"
     else
-        print_failure "Metrics script missing BACKUP_RUN_START pattern"
+        log_error "Metrics script missing BACKUP_RUN_START pattern"
         return 1
     fi
     
     if [[ -n "$run_complete_pattern" ]]; then
-        print_success "Metrics script recognizes BACKUP_RUN_COMPLETE pattern"
+        log_success "Metrics script recognizes BACKUP_RUN_COMPLETE pattern"
     else
-        print_failure "Metrics script missing BACKUP_RUN_COMPLETE pattern"
+        log_error "Metrics script missing BACKUP_RUN_COMPLETE pattern"
         return 1
     fi
     
     # Look for run_id parsing
     if grep -q "run_id=" "$BACKUP_METRICS"; then
-        print_success "Metrics script parses run_id parameter"
+        log_success "Metrics script parses run_id parameter"
     else
-        print_failure "Metrics script doesn't parse run_id parameter"
+        log_error "Metrics script doesn't parse run_id parameter"
         return 1
     fi
     
@@ -310,38 +287,42 @@ main() {
     TESTS_FAILED=0
     
     # Check that scripts exist
+# Main function to run all tests
+main() {
+    print_test_header "Simple Run ID Functionality Test Suite"
+    echo "Testing run ID generation, format, and basic parsing without complex setup"
+    echo
+    
+    # Check prerequisites
     if [[ ! -f "$BACKUP_SCRIPT" ]]; then
-        echo -e "${RED}ERROR: Backup script not found: $BACKUP_SCRIPT${NC}"
+        log_error "Backup script not found: $BACKUP_SCRIPT"
         exit 1
     fi
     
     if [[ ! -f "$BACKUP_METRICS" ]]; then
-        echo -e "${RED}ERROR: Metrics script not found: $BACKUP_METRICS${NC}"
+        log_error "Metrics script not found: $BACKUP_METRICS"
         exit 1
     fi
     
+    # Set up test count
+    increment_tests_total  # test_runid_format
+    increment_tests_total  # test_runid_generation
+    increment_tests_total  # test_runid_uniqueness
+    increment_tests_total  # test_metrics_script
+    increment_tests_total  # test_metrics_last_run
+    increment_tests_total  # test_runid_log_format
+    
     # Run tests
-    test_runid_format
-    test_runid_generation
-    test_runid_uniqueness
-    test_metrics_script
-    test_metrics_last_run
-    test_runid_log_format
+    test_runid_format || true
+    test_runid_generation || true
+    test_runid_uniqueness || true
+    test_metrics_script || true
+    test_metrics_last_run || true
+    test_runid_log_format || true
     
     # Results
     echo
-    print_test_header "Simple Run ID Test Results"
-    echo -e "Tests run: ${BLUE}$TESTS_RUN${NC}"
-    echo -e "Passed: ${GREEN}$TESTS_PASSED${NC}"
-    echo -e "Failed: ${RED}$TESTS_FAILED${NC}"
-    
-    if [[ $TESTS_FAILED -eq 0 ]]; then
-        echo -e "${GREEN}All run ID tests passed!${NC}"
-        exit 0
-    else
-        echo -e "${RED}Some run ID tests failed!${NC}"
-        exit 1
-    fi
+    print_test_summary "Simple Run ID Test"
 }
 
 # Handle arguments

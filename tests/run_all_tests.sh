@@ -2,15 +2,11 @@
 # Master Test Orchestrator for Backup System
 # Runs all test suites in sequence and provides comprehensive reporting
 
-# Color definitions
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-PURPLE='\033[0;35m'
-NC='\033[0m'
+set -euo pipefail
+
+# Source common test library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/test_lib.sh"
 
 # Test configuration
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +17,10 @@ FULL_REPORT="$REPORT_DIR/full_test_report_$TIMESTAMP.txt"
 
 # Test suite definitions
 declare -A TEST_SUITES=(
-    ["comprehensive"]="$TEST_DIR/test_runner.sh"
+    ["environment"]="$TEST_DIR/test_environment.sh"
+    ["connectivity"]="$TEST_DIR/test_connectivity.sh"
+    ["help"]="$TEST_DIR/test_help_functionality.sh"
+    ["runid_simple"]="$TEST_DIR/test_runid_simple.sh"
     ["runid"]="$TEST_DIR/test_runid.sh"
     ["performance"]="$TEST_DIR/test_performance.sh"
 )
@@ -32,31 +31,7 @@ PASSED_SUITES=0
 FAILED_SUITES=()
 SUITE_RESULTS=()
 
-print_banner() {
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}                     BACKUP SYSTEM TEST ORCHESTRATOR                       ${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-}
-
-print_header() {
-    echo -e "\n${PURPLE}▶▶▶ $1 ◀◀◀${NC}"
-}
-
-print_success() {
-    echo -e "${GREEN}✓${NC} $1"
-}
-
-print_failure() {
-    echo -e "${RED}✗${NC} $1"
-}
-
-print_info() {
-    echo -e "${BLUE}ℹ${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
-}
+# Test orchestration functions
 
 # Initialize test environment
 init_test_environment() {
@@ -80,12 +55,12 @@ EOF
     
     # Check if backup scripts exist
     if [[ ! -f "$BACKUP_DIR/backup-new.sh" ]]; then
-        print_failure "backup-new.sh not found in $BACKUP_DIR"
+        log_error "backup-new.sh not found in $BACKUP_DIR"
         exit 1
     fi
     
     if [[ ! -f "$BACKUP_DIR/backup-metrics" ]]; then
-        print_failure "backup-metrics not found in $BACKUP_DIR"
+        log_error "backup-metrics not found in $BACKUP_DIR"
         exit 1
     fi
     
@@ -93,12 +68,12 @@ EOF
     for suite_name in "${!TEST_SUITES[@]}"; do
         local script="${TEST_SUITES[$suite_name]}"
         if [[ ! -f "$script" ]]; then
-            print_failure "Test script not found: $script"
+            log_error "Test script not found: $script"
             exit 1
         fi
         
         if [[ ! -x "$script" ]]; then
-            print_failure "Test script not executable: $script"
+            log_error "Test script not executable: $script"
             exit 1
         fi
     done
@@ -116,7 +91,7 @@ EOF
         print_warning "bc calculator not found - performance tests may fail"
     fi
     
-    print_success "Test environment initialized"
+    log_success "Test environment initialized"
     
     # Log environment info
     {
@@ -162,7 +137,7 @@ run_test_suite() {
         end_time=$(date +%s)
         duration=$((end_time - start_time))
         
-        print_success "Test suite '$suite_name' passed (${duration}s)"
+        log_success "Test suite '$suite_name' passed (${duration}s)"
         ((PASSED_SUITES++))
         SUITE_RESULTS+=("PASS: $suite_name (${duration}s)")
         
@@ -172,7 +147,7 @@ run_test_suite() {
         end_time=$(date +%s)
         duration=$((end_time - start_time))
         
-        print_failure "Test suite '$suite_name' failed (${duration}s)"
+        log_error "Test suite '$suite_name' failed (${duration}s)"
         FAILED_SUITES+=("$suite_name")
         SUITE_RESULTS+=("FAIL: $suite_name (${duration}s)")
         
@@ -229,7 +204,7 @@ generate_final_report() {
         echo "Report generated: $(date)"
     } >> "$FULL_REPORT"
     
-    print_success "Full report saved to: $FULL_REPORT"
+    log_success "Full report saved to: $FULL_REPORT"
 }
 
 # Display final results
@@ -264,7 +239,7 @@ display_final_results() {
         
         return 1
     else
-        print_success "All test suites passed!"
+        log_success "All test suites passed!"
         print_info "Full report available at: $FULL_REPORT"
         return 0
     fi
@@ -280,7 +255,7 @@ cleanup_test_artifacts() {
     find /tmp -name "runid-*" -type d -exec rm -rf {} + 2>/dev/null || true
     find /tmp -name "*.lock" -path "/tmp/*backup*" -delete 2>/dev/null || true
     
-    print_success "Test artifacts cleaned up"
+    log_success "Test artifacts cleaned up"
 }
 
 # Show help
@@ -418,7 +393,7 @@ main() {
         if [[ -n "${TEST_SUITES[$suite]}" ]]; then
             run_test_suite "$suite"
         else
-            print_failure "Unknown test suite: $suite"
+            log_error "Unknown test suite: $suite"
             exit 1
         fi
     done

@@ -110,8 +110,11 @@ RUN echo '#!/bin/bash' > /opt/backup/start-backup.sh && \
     echo '    chown -R backup:backup /home/backup/.ssh' >> /opt/backup/start-backup.sh && \
     echo '    echo "SSH keys setup completed"' >> /opt/backup/start-backup.sh && \
     echo 'else' >> /opt/backup/start-backup.sh && \
-    echo '    echo "ERROR: SSH key not found at /etc/backup/ssh_keys/backup_key.pub"' >> /opt/backup/start-backup.sh && \
-    echo 'fi' >> /opt/backup/start-backup.sh && \
+    echo '    echo "ERROR: SSH key not found at /et# Backup Configuration with path-level scripts
+config:
+  backup_base: "/share/backup/"
+  lock_file: "/tmp/backup.fil"
+  rsync_options: "-avz --delete-after --ignore-errors"
     echo '' >> /opt/backup/start-backup.sh && \
     echo '# Keep container running' >> /opt/backup/start-backup.sh && \
     echo 'exec "$@"' >> /opt/backup/start-backup.sh && \

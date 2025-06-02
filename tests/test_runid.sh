@@ -2,35 +2,17 @@
 # Run ID Functionality Test Suite
 # Focused testing of run ID generation, logging, and metrics parsing
 
-# Color definitions
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+set -euo pipefail
+
+# Source common test library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/test_lib.sh"
 
 # Test configuration
-BACKUP_SCRIPT="$(dirname "$(dirname "$(realpath "$0")")")/backup-new.sh"
-METRICS_SCRIPT="$(dirname "$(dirname "$(realpath "$0")")")/backup-metrics"
+BACKUP_SCRIPT="$(get_backup_script_path)"
+METRICS_SCRIPT="$(get_metrics_script_path)"
 TEST_CONFIG_DIR="/tmp/backup-runid-test"
 TEST_LOG_DIR="/tmp/backup-runid-logs"
-
-print_test_header() {
-    echo -e "${CYAN}━━━ $1 ━━━${NC}"
-}
-
-print_success() {
-    echo -e "${GREEN}[PASS]${NC} $1"
-}
-
-print_failure() {
-    echo -e "${RED}[FAIL]${NC} $1"
-}
-
-print_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
 
 # Setup minimal test environment
 setup_runid_test() {
@@ -74,6 +56,9 @@ EOF
 
 # Test run ID generation
 test_runid_generation() {
+    log_info "Testing Run ID generation..."
+    run_test
+    
     print_test_header "Testing Run ID Generation"
     
     local output1 output2 runid1 runid2
@@ -83,7 +68,7 @@ test_runid_generation() {
     runid1=$(echo "$output1" | grep "Generated run ID:" | sed 's/.*Generated run ID: //')
     
     if [[ -z "$runid1" ]]; then
-        print_failure "Could not extract first run ID"
+        log_error "Could not extract first run ID"
         return 1
     fi
     
@@ -94,29 +79,29 @@ test_runid_generation() {
     runid2=$(echo "$output2" | grep "Generated run ID:" | sed 's/.*Generated run ID: //')
     
     if [[ -z "$runid2" ]]; then
-        print_failure "Could not extract second run ID"
+        log_error "Could not extract second run ID"
         return 1
     fi
     
     # Test uniqueness
     if [[ "$runid1" == "$runid2" ]]; then
-        print_failure "Run IDs are not unique: $runid1 == $runid2"
+        log_error "Run IDs are not unique: $runid1 == $runid2"
         return 1
     fi
     
     # Test format (should be numeric)
     if [[ ! "$runid1" =~ ^[0-9]+$ ]]; then
-        print_failure "Run ID format invalid: $runid1"
+        log_error "Run ID format invalid: $runid1"
         return 1
     fi
     
     # Test length (should be reasonable)
     if [[ ${#runid1} -lt 10 ]]; then
-        print_failure "Run ID too short: $runid1 (${#runid1} chars)"
+        log_error "Run ID too short: $runid1 (${#runid1} chars)"
         return 1
     fi
     
-    print_success "Run ID generation: unique IDs $runid1 and $runid2"
+    log_success "Run ID generation: unique IDs $runid1 and $runid2"
     return 0
 }
 
@@ -133,31 +118,31 @@ test_runid_logging() {
     runid=$(echo "$output" | grep "Generated run ID:" | sed 's/.*Generated run ID: //')
     
     if [[ -z "$runid" ]]; then
-        print_failure "Could not extract run ID from backup output"
+        log_error "Could not extract run ID from backup output"
         return 1
     fi
     
     # Check BACKUP_RUN_START
     if ! echo "$output" | grep -q "BACKUP_RUN_START:.*run_id=$runid"; then
-        print_failure "BACKUP_RUN_START missing or incorrect run_id"
+        log_error "BACKUP_RUN_START missing or incorrect run_id"
         return 1
     fi
     
     # Check BACKUP_RUN_COMPLETE
     if ! echo "$output" | grep -q "BACKUP_RUN_COMPLETE:.*run_id=$runid"; then
-        print_failure "BACKUP_RUN_COMPLETE missing or incorrect run_id"
+        log_error "BACKUP_RUN_COMPLETE missing or incorrect run_id"
         return 1
     fi
     
     # Check for RSYNC_STATS if present
     if echo "$output" | grep -q "RSYNC_STATS:"; then
         if ! echo "$output" | grep -q "RSYNC_STATS:.*run_id=$runid"; then
-            print_failure "RSYNC_STATS missing or incorrect run_id"
+            log_error "RSYNC_STATS missing or incorrect run_id"
             return 1
         fi
     fi
     
-    print_success "Run ID logging: consistent run_id $runid in all log entries"
+    log_success "Run ID logging: consistent run_id $runid in all log entries"
     return 0
 }
 
@@ -172,7 +157,7 @@ test_metrics_runid_parsing() {
     local backup_exit_code=$?
     
     if [[ $backup_exit_code -ne 0 ]]; then
-        print_failure "Test backup failed with exit code $backup_exit_code"
+        log_error "Test backup failed with exit code $backup_exit_code"
         echo "Backup output: $backup_output"
         return 1
     fi
@@ -182,7 +167,7 @@ test_metrics_runid_parsing() {
     test_runid=$(echo "$backup_output" | grep "Generated run ID:" | sed 's/.*Generated run ID: //')
     
     if [[ -z "$test_runid" ]]; then
-        print_failure "Could not extract run ID from backup output"
+        log_error "Could not extract run ID from backup output"
         return 1
     fi
     
@@ -196,7 +181,7 @@ test_metrics_runid_parsing() {
     local exit_code=$?
     
     if [[ $exit_code -ne 0 ]]; then
-        print_failure "Metrics script failed with exit code $exit_code"
+        log_error "Metrics script failed with exit code $exit_code"
         echo "Output: $metrics_output"
         return 1
     fi
@@ -209,12 +194,12 @@ test_metrics_runid_parsing() {
         print_info "Metrics script found existing backup runs from systemd logs"
         # Check for run ID formatting
         if ! echo "$metrics_output" | grep -qE "(ID: time_|run_id=)"; then
-            print_failure "Metrics script output doesn't contain run ID information"
+            log_error "Metrics script output doesn't contain run ID information"
             echo "Metrics output: $metrics_output"
             return 1
         fi
     else
-        print_failure "Metrics script produced unexpected output"
+        log_error "Metrics script produced unexpected output"
         echo "Metrics output: $metrics_output"
         return 1
     fi
@@ -225,11 +210,11 @@ test_metrics_runid_parsing() {
     local version_exit_code=$?
     
     if [[ $version_exit_code -ne 0 ]]; then
-        print_failure "Metrics script --version failed with exit code $version_exit_code"
+        log_error "Metrics script --version failed with exit code $version_exit_code"
         return 1
     fi
     
-    print_success "Metrics parsing: script is functional and shows backup run information with IDs"
+    log_success "Metrics parsing: script is functional and shows backup run information with IDs"
     return 0
 }
 
@@ -248,7 +233,7 @@ test_multiple_runs() {
         local backup_exit_code=$?
         
         if [[ $backup_exit_code -ne 0 ]]; then
-            print_failure "Backup $i failed with exit code $backup_exit_code"
+            log_error "Backup $i failed with exit code $backup_exit_code"
             echo "Output: $output"
             return 1
         fi
@@ -257,7 +242,7 @@ test_multiple_runs() {
         runid=$(echo "$output" | grep "Generated run ID:" | sed 's/.*Generated run ID: //')
         
         if [[ -z "$runid" ]]; then
-            print_failure "Could not extract run ID from backup $i"
+            log_error "Could not extract run ID from backup $i"
             return 1
         fi
         
@@ -274,7 +259,7 @@ test_multiple_runs() {
     for ((i=0; i<${#runids[@]}; i++)); do
         for ((j=i+1; j<${#runids[@]}; j++)); do
             if [[ "${runids[i]}" == "${runids[j]}" ]]; then
-                print_failure "Duplicate run IDs found: ${runids[i]} (runs $((i+1)) and $((j+1)))"
+                log_error "Duplicate run IDs found: ${runids[i]} (runs $((i+1)) and $((j+1)))"
                 return 1
             fi
         done
@@ -289,7 +274,7 @@ test_multiple_runs() {
     local metrics_exit_code=$?
     
     if [[ $metrics_exit_code -ne 0 ]]; then
-        print_failure "Metrics script failed with exit code $metrics_exit_code"
+        log_error "Metrics script failed with exit code $metrics_exit_code"
         echo "Metrics output: $metrics_output"
         return 1
     fi
@@ -299,12 +284,12 @@ test_multiple_runs() {
     run_count=$(echo "$metrics_output" | grep -c "BACKUP RUN" || echo "0")
     
     if [[ $run_count -eq 0 ]]; then
-        print_failure "Metrics script didn't show any backup runs"
+        log_error "Metrics script didn't show any backup runs"
         echo "Metrics output: $metrics_output"
         return 1
     fi
     
-    print_success "Multiple runs: generated ${#runids[@]} unique run IDs, metrics script shows $run_count runs from systemd logs"
+    log_success "Multiple runs: generated ${#runids[@]} unique run IDs, metrics script shows $run_count runs from systemd logs"
     return 0
 }
 
@@ -346,7 +331,7 @@ EOF
     mapfile -t run_ids < <(echo "$output" | grep -o "run_id=[^ ]*" | cut -d= -f2 | sort -u)
     
     if [[ ${#run_ids[@]} -ne 1 ]]; then
-        print_failure "Inconsistent run IDs found: ${run_ids[*]} (expected exactly 1 unique ID)"
+        log_error "Inconsistent run IDs found: ${run_ids[*]} (expected exactly 1 unique ID)"
         return 1
     fi
     
@@ -357,11 +342,11 @@ EOF
     runid_count=$(echo "$output" | grep -c "run_id=$runid")
     
     if [[ $runid_count -lt 2 ]]; then
-        print_failure "Run ID appears too few times: $runid_count (expected at least 2)"
+        log_error "Run ID appears too few times: $runid_count (expected at least 2)"
         return 1
     fi
     
-    print_success "Run ID consistency: $runid used consistently $runid_count times"
+    log_success "Run ID consistency: $runid used consistently $runid_count times"
     return 0
 }
 
@@ -399,7 +384,7 @@ EOF
     runid=$(echo "$output" | grep "Generated run ID:" | sed 's/.*Generated run ID: //')
     
     if [[ -n "$runid" ]]; then
-        print_success "Error scenario: run ID $runid generated even with path errors (exit code: $exit_code)"
+        log_success "Error scenario: run ID $runid generated even with path errors (exit code: $exit_code)"
         return 0
     fi
     
@@ -413,11 +398,11 @@ EOF
     
     # This should definitely fail early
     if [[ $corrupt_exit_code -eq 0 ]]; then
-        print_failure "Corrupted config test should have failed"
+        log_error "Corrupted config test should have failed"
         return 1
     fi
     
-    print_success "Error scenario: backup appropriately fails with corrupted config (exit code: $corrupt_exit_code)"
+    log_success "Error scenario: backup appropriately fails with corrupted config (exit code: $corrupt_exit_code)"
     return 0
 }
 
@@ -436,22 +421,22 @@ test_metrics_delete_data() {
     
     # Should mention deletion and then be cancelled
     if echo "$delete_output" | grep -q "WARNING.*delete.*ALL.*backup.*data"; then
-        print_success "Delete data: Shows proper warning about data deletion"
+        log_success "Delete data: Shows proper warning about data deletion"
     else
-        print_failure "Delete data: Missing proper warning about data deletion"
+        log_error "Delete data: Missing proper warning about data deletion"
         echo "Output: $delete_output"
         return 1
     fi
     
     if echo "$delete_output" | grep -q -i "cancel"; then
-        print_success "Delete data: Properly handles cancellation"
+        log_success "Delete data: Properly handles cancellation"
     else
-        print_failure "Delete data: Doesn't handle cancellation properly"
+        log_error "Delete data: Doesn't handle cancellation properly"
         echo "Output: $delete_output"
         return 1
     fi
     
-    print_success "Delete data functionality: parameter parsing and safety checks working"
+    log_success "Delete data functionality: parameter parsing and safety checks working"
     return 0
 }
 
@@ -469,7 +454,7 @@ cleanup_runid_test() {
     rm -f "/tmp/runid-multi.lock"
     rm -f "/tmp/runid-error.lock"
     
-    print_success "Cleanup completed"
+    log_success "Cleanup completed"
 }
 
 # Main execution
@@ -478,36 +463,32 @@ main() {
     echo "Focused testing of run ID generation, logging, and metrics parsing"
     echo
     
-    local tests_passed=0
-    local tests_total=7
+    # Set up test count
+    increment_tests_total  # test_runid_generation
+    increment_tests_total  # test_runid_logging
+    increment_tests_total  # test_metrics_runid_parsing
+    increment_tests_total  # test_multiple_runs
+    increment_tests_total  # test_runid_consistency
+    increment_tests_total  # test_runid_error_scenarios
+    increment_tests_total  # test_metrics_delete_data
     
     # Setup
     setup_runid_test
     
     # Run tests
-    if test_runid_generation; then ((tests_passed++)); fi
-    if test_runid_logging; then ((tests_passed++)); fi
-    if test_metrics_runid_parsing; then ((tests_passed++)); fi
-    if test_multiple_runs; then ((tests_passed++)); fi
-    if test_runid_consistency; then ((tests_passed++)); fi
-    if test_runid_error_scenarios; then ((tests_passed++)); fi
-    if test_metrics_delete_data; then ((tests_passed++)); fi
+    test_runid_generation || true
+    test_runid_logging || true
+    test_metrics_runid_parsing || true
+    test_multiple_runs || true
+    test_runid_consistency || true
+    test_runid_error_scenarios || true
+    test_metrics_delete_data || true
     
     # Cleanup
     cleanup_runid_test
     
     # Results
-    echo
-    print_test_header "Run ID Test Results"
-    echo -e "Passed: ${GREEN}$tests_passed${NC}/$tests_total"
-    
-    if [[ $tests_passed -eq $tests_total ]]; then
-        echo -e "${GREEN}All run ID tests passed!${NC}"
-        exit 0
-    else
-        echo -e "${RED}Some run ID tests failed!${NC}"
-        exit 1
-    fi
+    print_test_summary "Run ID Test"
 }
 
 # Handle arguments

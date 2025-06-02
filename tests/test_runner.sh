@@ -2,20 +2,9 @@
 # Comprehensive Test Suite for Backup System
 # Tests backup-new.sh and backup-metrics scripts
 
-# Color definitions for test output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-NC='\033[0m' # No Color
-
-# Test counters
-TESTS_TOTAL=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-TESTS_SKIPPED=0
+# Source common test library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/test_lib.sh"
 
 # Test configuration
 BACKUP_SCRIPT="$(dirname "$(dirname "$(realpath "$0")")")/backup-new.sh"
@@ -24,53 +13,6 @@ TEST_CONFIG_DIR="/tmp/backup-test-config"
 TEST_BACKUP_DIR="/tmp/backup-test-data"
 TEST_LOG_FILE="/tmp/test-backup.log"
 TEST_STATS_LOG="/tmp/test-backup-stats.log"
-
-# Test result tracking
-TEST_RESULTS=()
-
-print_test_header() {
-    echo -e "${CYAN}━━━ $1 ━━━${NC}"
-}
-
-print_test_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-print_test_success() {
-    echo -e "${GREEN}[PASS]${NC} $1"
-    ((TESTS_PASSED++))
-}
-
-print_test_failure() {
-    echo -e "${RED}[FAIL]${NC} $1"
-    ((TESTS_FAILED++))
-    TEST_RESULTS+=("FAIL: $1")
-}
-
-print_test_warning() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-print_test_skip() {
-    echo -e "${YELLOW}[SKIP]${NC} $1"
-    ((TESTS_SKIPPED++))
-}
-
-# Helper function to run a test
-run_test() {
-    local test_name="$1"
-    local test_function="$2"
-    
-    ((TESTS_TOTAL++))
-    print_test_info "Running test: $test_name"
-    
-    if $test_function; then
-        print_test_success "$test_name"
-    else
-        print_test_failure "$test_name"
-    fi
-    echo
-}
 
 # Setup test environment
 setup_test_environment() {
@@ -491,6 +433,22 @@ test_integration() {
     return 0
 }
 
+# Helper function to run a test
+run_test() {
+    local test_name="$1"
+    local test_function="$2"
+    
+    increment_tests_total
+    print_test_info "Running test: $test_name"
+    
+    if $test_function; then
+        print_test_success "$test_name"
+    else
+        print_test_failure "$test_name"
+    fi
+    echo
+}
+
 # Main test execution
 main() {
     print_test_header "Backup System Comprehensive Test Suite"
@@ -517,24 +475,11 @@ main() {
     # Cleanup
     cleanup_test_environment
     
-    # Print results
-    print_test_header "Test Results Summary"
-    echo -e "Total tests: ${WHITE}$TESTS_TOTAL${NC}"
-    echo -e "Passed: ${GREEN}$TESTS_PASSED${NC}"
-    echo -e "Failed: ${RED}$TESTS_FAILED${NC}"
-    echo -e "Skipped: ${YELLOW}$TESTS_SKIPPED${NC}"
-    echo
-    
-    if [[ $TESTS_FAILED -gt 0 ]]; then
-        echo -e "${RED}Failed tests:${NC}"
-        for result in "${TEST_RESULTS[@]}"; do
-            echo -e "  ${RED}•${NC} $result"
-        done
-        echo
-        exit 1
-    else
-        echo -e "${GREEN}All tests passed!${NC}"
+    # Print results using library function
+    if print_test_summary "Comprehensive Test Suite"; then
         exit 0
+    else
+        exit 1
     fi
 }
 

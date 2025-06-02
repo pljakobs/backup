@@ -2,40 +2,17 @@
 # Performance and Stress Test for Backup System
 # Tests system behavior under load and various edge cases
 
-# Color definitions
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-NC='\033[0m'
+set -euo pipefail
+
+# Source common test library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/test_lib.sh"
 
 # Test configuration
-BACKUP_SCRIPT="$(dirname "$(dirname "$(realpath "$0")")")/backup-new.sh"
-METRICS_SCRIPT="$(dirname "$(dirname "$(realpath "$0")")")/backup-metrics"
+BACKUP_SCRIPT="$(get_backup_script_path)"
+METRICS_SCRIPT="$(get_metrics_script_path)"
 TEST_BASE_DIR="/tmp/backup-stress-test"
 PERF_LOG_FILE="$TEST_BASE_DIR/performance.log"
-
-print_header() {
-    echo -e "${CYAN}━━━ $1 ━━━${NC}"
-}
-
-print_success() {
-    echo -e "${GREEN}[PASS]${NC} $1"
-}
-
-print_failure() {
-    echo -e "${RED}[FAIL]${NC} $1"
-}
-
-print_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
 
 # Setup stress test environment
 setup_stress_test() {
@@ -119,7 +96,7 @@ influxdb:
   bucket: "stress-metrics"
 EOF
 
-    print_success "Stress test environment setup completed"
+    log_success "Stress test environment setup completed"
     echo "  Small files: 1000 x 1KB"
     echo "  Medium files: 100 x 100KB"
     echo "  Large files: 10 x 10MB"
@@ -129,6 +106,9 @@ EOF
 
 # Performance timing test
 test_backup_performance() {
+    log_info "Testing backup performance..."
+    run_test
+    
     print_header "Testing Backup Performance"
     
     local start_time end_time duration
@@ -145,11 +125,11 @@ test_backup_performance() {
     duration=$(echo "$end_time - $start_time" | bc -l)
     
     if [[ $exit_code -ne 0 ]]; then
-        print_failure "Initial backup failed with exit code $exit_code"
+        log_error "Initial backup failed with exit code $exit_code"
         return 1
     fi
     
-    print_success "Initial backup completed in ${duration}s"
+    log_success "Initial backup completed in ${duration}s"
     echo "PERF: initial_backup_time=${duration}s" >> "$PERF_LOG_FILE"
     
     # Incremental backup (should be faster)
@@ -163,11 +143,11 @@ test_backup_performance() {
     duration=$(echo "$end_time - $start_time" | bc -l)
     
     if [[ $exit_code -ne 0 ]]; then
-        print_failure "Incremental backup failed with exit code $exit_code"
+        log_error "Incremental backup failed with exit code $exit_code"
         return 1
     fi
     
-    print_success "Incremental backup completed in ${duration}s"
+    log_success "Incremental backup completed in ${duration}s"
     echo "PERF: incremental_backup_time=${duration}s" >> "$PERF_LOG_FILE"
     
     return 0
@@ -175,6 +155,9 @@ test_backup_performance() {
 
 # Test rapid consecutive backups
 test_rapid_consecutive_backups() {
+    log_info "Testing rapid consecutive backups..."
+    run_test
+    
     print_header "Testing Rapid Consecutive Backups"
     
     local run_ids=()
@@ -194,7 +177,7 @@ test_rapid_consecutive_backups() {
         duration=$(echo "$end_time - $start_time" | bc -l)
         
         if [[ $exit_code -ne 0 ]]; then
-            print_failure "Rapid backup $i failed with exit code $exit_code"
+            log_error "Rapid backup $i failed with exit code $exit_code"
             return 1
         fi
         
@@ -203,7 +186,7 @@ test_rapid_consecutive_backups() {
         runid=$(echo "$output" | grep "Generated run ID:" | sed 's/.*Generated run ID: //')
         
         if [[ -z "$runid" ]]; then
-            print_failure "Could not extract run ID from rapid backup $i"
+            log_error "Could not extract run ID from rapid backup $i"
             return 1
         fi
         
@@ -220,11 +203,11 @@ test_rapid_consecutive_backups() {
     local unique_ids=($(printf '%s\n' "${run_ids[@]}" | sort -u))
     
     if [[ ${#unique_ids[@]} -ne ${#run_ids[@]} ]]; then
-        print_failure "Non-unique run IDs detected in rapid backups"
+        log_error "Non-unique run IDs detected in rapid backups"
         return 1
     fi
     
-    print_success "Rapid consecutive backups: ${#run_ids[@]} unique run IDs generated"
+    log_success "Rapid consecutive backups: ${#run_ids[@]} unique run IDs generated"
     echo "PERF: rapid_backups_count=${#run_ids[@]}" >> "$PERF_LOG_FILE"
     
     return 0
@@ -256,11 +239,11 @@ test_metrics_performance() {
     duration=$(echo "$end_time - $start_time" | bc -l)
     
     if [[ $exit_code -ne 0 ]]; then
-        print_failure "Metrics --last-run failed with exit code $exit_code"
+        log_error "Metrics --last-run failed with exit code $exit_code"
         return 1
     fi
     
-    print_success "Metrics --last-run completed in ${duration}s"
+    log_success "Metrics --last-run completed in ${duration}s"
     echo "PERF: metrics_last_run_time=${duration}s" >> "$PERF_LOG_FILE"
     
     # Test with multiple runs
@@ -274,11 +257,11 @@ test_metrics_performance() {
     duration=$(echo "$end_time - $start_time" | bc -l)
     
     if [[ $exit_code -ne 0 ]]; then
-        print_failure "Metrics --runs 10 failed with exit code $exit_code"
+        log_error "Metrics --runs 10 failed with exit code $exit_code"
         return 1
     fi
     
-    print_success "Metrics --runs 10 completed in ${duration}s"
+    log_success "Metrics --runs 10 completed in ${duration}s"
     echo "PERF: metrics_multiple_runs_time=${duration}s" >> "$PERF_LOG_FILE"
     
     return 0
@@ -315,7 +298,7 @@ EOF
     duration=$(echo "$end_time - $start_time" | bc -l)
     
     if [[ $exit_code -ne 0 ]]; then
-        print_failure "Large file backup failed with exit code $exit_code"
+        log_error "Large file backup failed with exit code $exit_code"
         return 1
     fi
     
@@ -325,11 +308,11 @@ EOF
     backup_size=$(stat -c%s "$TEST_BASE_DIR/backup/largefile/large_test_file.bin" 2>/dev/null || echo "0")
     
     if [[ "$original_size" -ne "$backup_size" ]]; then
-        print_failure "Large file backup size mismatch: original=$original_size, backup=$backup_size"
+        log_error "Large file backup size mismatch: original=$original_size, backup=$backup_size"
         return 1
     fi
     
-    print_success "Large file (100MB) backup completed in ${duration}s"
+    log_success "Large file (100MB) backup completed in ${duration}s"
     echo "PERF: large_file_backup_time=${duration}s" >> "$PERF_LOG_FILE"
     echo "PERF: large_file_size_mb=100" >> "$PERF_LOG_FILE"
     
@@ -360,13 +343,13 @@ test_concurrent_backup_prevention() {
     
     # The concurrent backup should fail
     if [[ $exit_code -eq 0 ]]; then
-        print_failure "Concurrent backup should have failed but succeeded"
+        log_error "Concurrent backup should have failed but succeeded"
         return 1
     fi
     
     # The background backup should succeed
     if [[ $bg_exit_code -ne 0 ]]; then
-        print_failure "Background backup failed with exit code $bg_exit_code"
+        log_error "Background backup failed with exit code $bg_exit_code"
         return 1
     fi
     
@@ -375,7 +358,7 @@ test_concurrent_backup_prevention() {
         print_warning "Concurrent backup failed but without clear lock message"
     fi
     
-    print_success "Concurrent backup prevention working correctly"
+    log_success "Concurrent backup prevention working correctly"
     return 0
 }
 
@@ -410,11 +393,11 @@ test_resource_usage() {
     wait $monitor_pid 2>/dev/null
     
     if [[ $exit_code -ne 0 ]]; then
-        print_failure "Resource usage test backup failed"
+        log_error "Resource usage test backup failed"
         return 1
     fi
     
-    print_success "Resource usage monitoring completed"
+    log_success "Resource usage monitoring completed"
     return 0
 }
 
@@ -426,7 +409,7 @@ cleanup_stress_test() {
     rm -rf "$TEST_BASE_DIR"
     rm -f "/tmp/backup-stress-test.lock"
     
-    print_success "Stress test cleanup completed"
+    log_success "Stress test cleanup completed"
 }
 
 # Generate performance report
@@ -471,23 +454,29 @@ main() {
     echo "Testing system behavior under load and edge cases"
     echo
     
-    local tests_passed=0
-    local tests_total=6
-    
     # Initialize performance log
-    echo "# Backup System Performance Test Results" > "$PERF_LOG_FILE"
+    setup_test_log "$PERF_LOG_FILE" "Performance Test"
+    echo "# Backup System Performance Test Results" >> "$PERF_LOG_FILE"
     echo "# Started: $(date)" >> "$PERF_LOG_FILE"
+    
+    # Setup total test count
+    increment_tests_total  # test_backup_performance
+    increment_tests_total  # test_rapid_consecutive_backups
+    increment_tests_total  # test_metrics_performance
+    increment_tests_total  # test_large_file_handling
+    increment_tests_total  # test_concurrent_backup_prevention
+    increment_tests_total  # test_resource_usage
     
     # Setup
     setup_stress_test
     
     # Run stress tests
-    if test_backup_performance; then ((tests_passed++)); fi
-    if test_rapid_consecutive_backups; then ((tests_passed++)); fi
-    if test_metrics_performance; then ((tests_passed++)); fi
-    if test_large_file_handling; then ((tests_passed++)); fi
-    if test_concurrent_backup_prevention; then ((tests_passed++)); fi
-    if test_resource_usage; then ((tests_passed++)); fi
+    test_backup_performance || true
+    test_rapid_consecutive_backups || true
+    test_metrics_performance || true
+    test_large_file_handling || true
+    test_concurrent_backup_prevention || true
+    test_resource_usage || true
     
     # Generate report
     generate_performance_report
@@ -496,17 +485,7 @@ main() {
     cleanup_stress_test
     
     # Results
-    echo
-    print_header "Stress Test Results"
-    echo -e "Passed: ${GREEN}$tests_passed${NC}/$tests_total"
-    
-    if [[ $tests_passed -eq $tests_total ]]; then
-        echo -e "${GREEN}All stress tests passed!${NC}"
-        exit 0
-    else
-        echo -e "${RED}Some stress tests failed!${NC}"
-        exit 1
-    fi
+    print_test_summary "Performance Test"
 }
 
 # Handle arguments

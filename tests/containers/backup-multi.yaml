@@ -1,0 +1,62 @@
+backup_base: "/share/backup"
+lock_file: "/tmp/backup.lock"
+rsync_options: "-avz --stats --delete"
+log_level: "INFO"
+parallel_jobs: 5
+
+hosts:
+  client1:
+    hostname: "client1"
+    ssh_user: "testuser"
+    ssh_key: "/etc/backup/ssh_keys/backup_key"
+    ssh_port: 2222
+    ignore_ping: false
+    paths:
+      - path: "/home/testuser/data"
+        dest_subdir: "testuser-data"
+      - path: "/etc/hostname"
+        dest_subdir: "system-config"
+  client2:
+    hostname: "client2"
+    ssh_user: "testuser"
+    ssh_key: "/etc/backup/ssh_keys/backup_key"
+    ssh_port: 2223
+    ignore_ping: false
+    paths:
+      - path: "/home/testuser/data"
+        dest_subdir: "testuser-data"
+      - path: "/etc/hostname"
+        dest_subdir: "system-config"
+  client3:
+    hostname: "client3"
+    ssh_user: "testuser"
+    ssh_key: "/etc/backup/ssh_keys/backup_key"
+    ssh_port: 2224
+    ignore_ping: false
+    paths:
+      - path: "/home/testuser/data"
+        dest_subdir: "testuser-data"
+      - path: "/etc/hostname"
+        dest_subdir: "system-config"
+  client4:
+    hostname: "client4"
+    ssh_user: "testuser"
+    ssh_key: "/etc/backup/ssh_keys/backup_key"
+    ssh_port: 2225
+    ignore_ping: false
+    paths:
+      - path: "/home/testuser/data"
+        dest_subdir: "testuser-data"
+      - path: "/etc/hostname"
+        dest_subdir: "system-config"
+  client5:
+    hostname: "client5"
+    ssh_user: "testuser"
+    ssh_key: "/etc/backup/ssh_keys/backup_key"
+    ssh_port: 2226
+    ignore_ping: false
+    paths:
+      - path: "/home/testuser/data"
+        dest_subdir: "testuser-data"
+      - path: "/etc/hostname"
+        dest_subdir: "system-config"

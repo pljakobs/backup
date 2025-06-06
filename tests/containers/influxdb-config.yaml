@@ -1,0 +1,9 @@
+influxdb:
+  url: "http://influxdb:8086"
+  token: "backup-test-token"
+  org: "backup-org"
+  bucket: "backup-metrics"
+
+systemd:
+  service_name: "backup"
+  journal_identifier: "backup"

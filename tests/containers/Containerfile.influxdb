@@ -1,0 +1,20 @@
+# InfluxDB container for metrics storage
+FROM influxdb:2.7-alpine
+
+# Create initialization script
+COPY containers/scripts/influxdb-init.sh /usr/local/bin/
+
+# Environment variables for initial setup
+ENV INFLUXDB_INIT_MODE=setup
+ENV INFLUXDB_INIT_USERNAME=admin
+ENV INFLUXDB_INIT_PASSWORD=backup-admin-password
+ENV INFLUXDB_INIT_ORG=backup-org
+ENV INFLUXDB_INIT_BUCKET=backup-metrics
+ENV INFLUXDB_INIT_ADMIN_TOKEN=backup-test-token
+
+# Expose InfluxDB port
+EXPOSE 8086
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8086/health || exit 1

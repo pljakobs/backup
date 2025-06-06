@@ -280,12 +280,18 @@ run_test_script() {
     local script="${TEST_SCRIPTS[$test_name]}"
     local test_report="$REPORT_DIR/${test_name}_report_$TIMESTAMP.txt"
     local timeout="${TEST_TIMEOUTS[$test_name]:-60}"
+    local prefix="${test_name:0:2}"
     
     print_header "Running Test: $test_name"
     print_info "Description: ${TEST_DESCRIPTIONS[$test_name]}"
     print_info "Script: $script"
     print_info "Report: $test_report"
     print_info "Timeout: ${timeout}s"
+    
+    # Parse container configuration for initialization tests (00 suite)
+    if [[ "$prefix" == "00" ]]; then
+        parse_container_config "$YAML_CONFIG" "$prefix"
+    fi
     
     TOTAL_SUITES=$((TOTAL_SUITES + 1))
     
@@ -446,6 +452,47 @@ run_test_script() {
     echo "" >> "$FULL_REPORT"
 }
 
+# Parse container configuration from YAML
+parse_container_config() {
+    local config_file="$1"
+    local suite_prefix="$2"
+    
+    # Default values
+    local clients="1"
+    local influxdb="true"
+    local grafana="true"
+    
+    if [[ -f "$config_file" ]] && command -v yq >/dev/null 2>&1; then
+        # Find the suite with the matching prefix pattern
+        local found_clients found_influxdb found_grafana
+        
+        # Look for suite with prefix pattern that matches our suite_prefix
+        while IFS=$'\t' read -r prefix clients_val influxdb_val grafana_val; do
+            [[ -z "$prefix" ]] && continue
+            
+            # Convert prefix pattern to match (e.g., "0*" matches "00")
+            if [[ "$prefix" =~ ^([0-9]+)\*$ ]]; then
+                local base_prefix="${BASH_REMATCH[1]}"
+                local numeric_prefix="${base_prefix}0"
+                
+                if [[ "$numeric_prefix" == "$suite_prefix" ]]; then
+                    [[ -n "$clients_val" ]] && clients="$clients_val"
+                    [[ -n "$influxdb_val" ]] && influxdb="$influxdb_val"
+                    [[ -n "$grafana_val" ]] && grafana="$grafana_val"
+                    break
+                fi
+            fi
+        done < <(yq eval '.suites[].suite | select(.container_config) | [.prefix, .container_config.clients, .container_config.influxdb, .container_config.grafana] | @tsv' "$config_file" 2>/dev/null)
+    fi
+    
+    # Export configuration as environment variables for the test
+    export TEST_CONTAINER_CLIENTS="$clients"
+    export TEST_CONTAINER_INFLUXDB="$influxdb"
+    export TEST_CONTAINER_GRAFANA="$grafana"
+    
+    print_info "Container configuration for suite $suite_prefix: clients=$clients, influxdb=$influxdb, grafana=$grafana"
+}
+
 # Generate final report
 generate_final_report() {
     print_header "Generating Final Report"
@@ -521,6 +568,43 @@ display_final_results() {
     fi
 }
 
+# Teardown test environment
+teardown_test_environment() {
+    print_header "Tearing Down Test Environment"
+    
+    # Look for teardown script in suite 90
+    local teardown_script=""
+    for script in "90-teardown_environment.sh" "90-teardown-environment.sh" "90-cleanup.sh"; do
+        if [[ -f "$script" ]]; then
+            teardown_script="$script"
+            break
+        fi
+    done
+    
+    if [[ -n "$teardown_script" ]]; then
+        print_info "Running environment teardown script: $teardown_script"
+        
+        # Run teardown script with timeout
+        local timeout=180
+        local start_time=$(date +%s)
+        
+        if timeout "$timeout" "./$teardown_script" > "$REPORT_DIR/teardown_$(date +%Y%m%d_%H%M%S).txt" 2>&1; then
+            local end_time=$(date +%s)
+            local duration=$((end_time - start_time))
+            log_success "Environment teardown completed successfully (${duration}s)"
+        else
+            local exit_code=$?
+            if [[ $exit_code -eq 124 ]]; then
+                print_warning "Environment teardown timed out after ${timeout}s"
+            else
+                print_warning "Environment teardown completed with warnings (exit code: $exit_code)"
+            fi
+        fi
+    else
+        print_warning "No teardown script found (looked for 90-teardown*.sh, 90-cleanup.sh)"
+    fi
+}
+
 # Cleanup test artifacts
 cleanup_test_artifacts() {
     print_header "Cleaning Up Test Artifacts"
@@ -564,6 +648,25 @@ Test Timeouts:
     - Performance tests: 300s
     - Advanced functionality: 180s
   Timed-out tests are marked as failures and logged appropriately.
+
+Container Environment:
+  The test suite uses containerized environments for isolation and reproducibility.
+  Container definitions are located in tests/containers/ subfolder:
+    - Container definitions: Containerfile.backup, Containerfile.client, etc.
+    - Container orchestration: test-environment.sh
+    - Configuration: test-suites.yaml (container_config section)
+  
+  Suite 00 (Initialization) automatically builds and starts required containers:
+    - backup-test: Main backup application container
+    - backup-client: Test client with SSH access (port 2222)
+    - backup-influxdb: InfluxDB for metrics collection (port 8086)
+    - backup-grafana: Grafana for visualization (port 3000)
+  
+  Container management commands:
+    ./containers/test-environment.sh start    # Start containers manually
+    ./containers/test-environment.sh status   # Check container status
+    ./containers/test-environment.sh stop     # Stop containers manually
+    ./containers/test-environment.sh clean    # Remove containers and data
 
 Critical Suites:
   Environment and Connectivity suites are marked as critical. If any test in a critical
@@ -796,6 +899,7 @@ parse_arguments() {
     
     # Handle special modes
     if [[ "$cleanup_only" == "true" ]]; then
+        teardown_test_environment
         cleanup_test_artifacts
         exit 0
     fi
@@ -870,6 +974,7 @@ main() {
     
     # Cleanup if requested
     if [[ "$NO_CLEANUP" != "true" ]]; then
+        teardown_test_environment
         cleanup_test_artifacts
     fi
     

@@ -1,0 +1,97 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Backup Monitoring Dashboard",
+    "tags": ["backup", "monitoring"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Backup Success Rate",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "from(bucket: \"backup-metrics\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"backup_session\")\n  |> filter(fn: (r) => r._field == \"success\")\n  |> aggregateWindow(every: 1h, fn: mean)\n  |> yield(name: \"mean\")",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": 0},
+                {"color": "yellow", "value": 0.8},
+                {"color": "green", "value": 0.95}
+              ]
+            },
+            "unit": "percentunit"
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Backup Duration",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "from(bucket: \"backup-metrics\")\n  |> range(start: -7d)\n  |> filter(fn: (r) => r._measurement == \"backup_session\")\n  |> filter(fn: (r) => r._field == \"duration_seconds\")\n  |> aggregateWindow(every: 2h, fn: mean)\n  |> yield(name: \"mean\")",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "unit": "s"
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "Data Transfer Volume",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "from(bucket: \"backup-metrics\")\n  |> range(start: -7d)\n  |> filter(fn: (r) => r._measurement == \"backup_session\")\n  |> filter(fn: (r) => r._field == \"total_size_bytes\")\n  |> aggregateWindow(every: 2h, fn: last)\n  |> yield(name: \"last\")",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "palette-classic"},
+            "unit": "bytes"
+          }
+        },
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "Recent Backup Runs by Host",
+        "type": "table",
+        "targets": [
+          {
+            "expr": "from(bucket: \"backup-metrics\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"backup_session\")\n  |> filter(fn: (r) => r._field == \"success\" or r._field == \"duration_seconds\" or r._field == \"total_size_bytes\")\n  |> pivot(rowKey:[\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> sort(columns: [\"_time\"], desc: true)\n  |> limit(n: 20)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "displayMode": "table"
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+      }
+    ],
+    "time": {
+      "from": "now-7d",
+      "to": "now"
+    },
+    "refresh": "30s"
+  }
+}

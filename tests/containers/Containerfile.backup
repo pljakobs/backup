@@ -1,0 +1,132 @@
+FROM registry.fedoraproject.org/fedora:42
+
+# Install required packages
+RUN dnf update -y && \
+    dnf install -y \
+        bash \
+        rsync \
+        openssh-clients \
+        python3 \
+        python3-pip \
+        systemd \
+        util-linux \
+        procps-ng \
+        findutils \
+        coreutils \
+        curl \
+        jq \
+        vim-minimal \
+        nc \
+        btrfs-progs \
+        golang \
+        wget \
+        bc \
+        stress \
+        time \
+        htop \
+        iotop \
+        sysstat \
+        iputils \
+    && dnf clean all
+
+# Install yq (YAML processor)
+RUN curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && \
+    chmod +x /usr/local/bin/yq
+
+# Install btrfs-snp for BTRFS snapshot management
+RUN mkdir -p /usr/local/sbin && \
+    curl -o /usr/local/sbin/btrfs-snp https://raw.githubusercontent.com/nachoparker/btrfs-snp/refs/heads/master/btrfs-snp && \
+    chmod +x /usr/local/sbin/btrfs-snp
+
+# Install job_pool.sh for parallel job management
+RUN curl -o /usr/local/bin/job_pool.sh https://raw.githubusercontent.com/vincetse/shellutils/master/job_pool.sh && \
+    chmod +x /usr/local/bin/job_pool.sh
+
+# Install Python dependencies
+RUN pip3 install influxdb-client pyyaml requests psutil
+
+# Create backup user and directories
+RUN useradd -m -s /bin/bash backup && \
+    mkdir -p /opt/backup /etc/backup /var/log/backup /var/lib/backup /etc/backup/ssh_keys && \
+    chown -R backup:backup /opt/backup /etc/backup /var/log/backup /var/lib/backup
+
+# Copy backup scripts
+COPY backup-new.sh backup-metrics /opt/backup/
+COPY job_pool.sh /opt/backup/
+COPY rm-all.sh setup-influxdb.sh setup-monitoring.sh /opt/backup/
+COPY setup-centralized-influxdb.sh /opt/backup/
+COPY tests/ /opt/backup/tests/
+COPY containers/test-container.sh /opt/backup/
+COPY generate-test-data.py /opt/backup/
+RUN chmod +x /opt/backup/backup-new.sh /opt/backup/backup-metrics /opt/backup/job_pool.sh \
+    /opt/backup/rm-all.sh /opt/backup/setup-influxdb.sh /opt/backup/setup-monitoring.sh \
+    /opt/backup/setup-centralized-influxdb.sh /opt/backup/tests/*.sh /opt/backup/test-container.sh
+
+# Create backup configuration
+RUN echo 'backup_base: "/var/lib/backup/data"' > /etc/backup/backup.yaml && \
+    echo 'lock_file: "/var/lib/backup/backup.lock"' >> /etc/backup/backup.yaml && \
+    echo 'rsync_options: "-avz --stats --delete"' >> /etc/backup/backup.yaml && \
+    echo 'log_level: "INFO"' >> /etc/backup/backup.yaml && \
+    echo '' >> /etc/backup/backup.yaml && \
+    echo 'hosts:' >> /etc/backup/backup.yaml && \
+    echo '  client:' >> /etc/backup/backup.yaml && \
+    echo '    hostname: "client"' >> /etc/backup/backup.yaml && \
+    echo '    ssh_user: "testuser"' >> /etc/backup/backup.yaml && \
+    echo '    ssh_key: "/etc/backup/ssh_keys/backup_key"' >> /etc/backup/backup.yaml && \
+    echo '    ignore_ping: false' >> /etc/backup/backup.yaml && \
+    echo '    paths:' >> /etc/backup/backup.yaml && \
+    echo '      - path: "/home/testuser/data"' >> /etc/backup/backup.yaml && \
+    echo '        dest_subdir: "testuser-data"' >> /etc/backup/backup.yaml && \
+    echo '      - path: "/etc/hostname"' >> /etc/backup/backup.yaml && \
+    echo '        dest_subdir: "system-config"' >> /etc/backup/backup.yaml
+
+# Create InfluxDB configuration
+RUN echo 'influxdb:' > /etc/backup/influxdb-config.yaml && \
+    echo '  url: "http://influxdb:8086"' >> /etc/backup/influxdb-config.yaml && \
+    echo '  token: "backup-test-token"' >> /etc/backup/influxdb-config.yaml && \
+    echo '  org: "backup-org"' >> /etc/backup/influxdb-config.yaml && \
+    echo '  bucket: "backup-metrics"' >> /etc/backup/influxdb-config.yaml && \
+    echo '' >> /etc/backup/influxdb-config.yaml && \
+    echo 'systemd:' >> /etc/backup/influxdb-config.yaml && \
+    echo '  service_name: "backup"' >> /etc/backup/influxdb-config.yaml && \
+    echo '  journal_identifier: "backup"' >> /etc/backup/influxdb-config.yaml
+
+# Generate SSH key
+RUN ssh-keygen -t rsa -b 2048 -f /etc/backup/ssh_keys/backup_key -N "" && \
+    chown -R backup:backup /etc/backup/ssh_keys
+
+# Create test runner
+RUN echo '#!/bin/bash' > /opt/backup/run-tests.sh && \
+    echo 'cd /opt/backup' >> /opt/backup/run-tests.sh && \
+    echo './test-container.sh' >> /opt/backup/run-tests.sh && \
+    chmod +x /opt/backup/run-tests.sh
+
+# Create startup script that copies SSH key to shared volume
+RUN echo '#!/bin/bash' > /opt/backup/start-backup.sh && \
+    echo 'echo "Starting backup container..."' >> /opt/backup/start-backup.sh && \
+    echo '' >> /opt/backup/start-backup.sh && \
+    echo '# Copy SSH public key to shared volume for client container' >> /opt/backup/start-backup.sh && \
+    echo 'if [ -f "/etc/backup/ssh_keys/backup_key.pub" ]; then' >> /opt/backup/start-backup.sh && \
+    echo '    mkdir -p /shared/ssh-keys' >> /opt/backup/start-backup.sh && \
+    echo '    cp /etc/backup/ssh_keys/backup_key.pub /shared/ssh-keys/' >> /opt/backup/start-backup.sh && \
+    echo '    chmod 644 /shared/ssh-keys/backup_key.pub' >> /opt/backup/start-backup.sh && \
+    echo '    echo "SSH public key copied to shared volume"' >> /opt/backup/start-backup.sh && \
+    echo 'else' >> /opt/backup/start-backup.sh && \
+    echo '    echo "Warning: SSH public key not found"' >> /opt/backup/start-backup.sh && \
+    echo 'fi' >> /opt/backup/start-backup.sh && \
+    echo '' >> /opt/backup/start-backup.sh && \
+    echo '# Keep container running' >> /opt/backup/start-backup.sh && \
+    echo 'while true; do sleep 30; done' >> /opt/backup/start-backup.sh && \
+    chmod +x /opt/backup/start-backup.sh
+
+ENV PATH="/opt/backup:/usr/local/bin:${PATH}"
+ENV DEBIAN_FRONTEND=noninteractive
+# Alias sudo to empty string since containers run as root by default
+RUN echo 'alias sudo=""' >> /etc/bash.bashrc
+WORKDIR /opt/backup
+USER backup
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD test -x /opt/backup/backup-new.sh || exit 1
+
+CMD ["/opt/backup/start-backup.sh"]

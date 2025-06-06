@@ -5,6 +5,16 @@
 
 suites:
   - suite:
+      prefix: "0*"
+      shortname: "Initialization"
+      description: "set up test environment and prerequisites"
+      critical: true
+      container_config:
+        clients: 5
+        influxdb: true
+        grafana: true
+
+  - suite:
       prefix: "1*"
       shortname: "Environment" 
       description: "Environment and prerequisite validation tests"
@@ -45,3 +55,8 @@ suites:
       shortname: "Metrics"
       description: "Metrics collection, monitoring, and reporting validation tests"
       critical: false
+
+  - suite:
+      prefix: "9*"
+      shortname: "Cleanup"
+      description: "Cleanup and teardown test enviroment to ensure no residual data or processes remain"

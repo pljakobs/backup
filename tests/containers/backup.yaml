@@ -1,0 +1,16 @@
+backup_base: "/var/lib/backup/data"
+lock_file: "/var/lib/backup/backup.lock"
+rsync_options: "-avz --stats --delete"
+log_level: "INFO"
+
+hosts:
+  client:
+    hostname: "client"
+    ssh_user: "testuser"
+    ssh_key: "/etc/backup/ssh_keys/backup_key"
+    ignore_ping: true
+    paths:
+      - path: "/home/testuser/data"
+        dest_subdir: "testuser-data"
+      - path: "/etc/hostname"
+        dest_subdir: "system-config"

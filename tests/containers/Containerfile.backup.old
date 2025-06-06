@@ -1,0 +1,101 @@
+FROM registry.fedoraproject.org/fedora:42
+
+# Install required packages
+RUN dnf update -y && \
+    dnf install -y \
+        bash \
+        rsync \
+        openssh-clients \
+        openssh-server \
+        python3 \
+        python3-pip \
+        python3-yaml \
+        python3-requests \
+        systemd \
+        util-linux \
+        procps-ng \
+        findutils \
+        coreutils \
+        iproute \
+        iputils \
+        net-tools \
+        curl \
+        jq \
+        vim-minimal \
+        nc \
+    && dnf clean all
+
+# Install Python dependencies
+RUN pip3 install influxdb-client pyyaml requests
+
+# Create backup user and directories
+RUN useradd -m -s /bin/bash backup && \
+    mkdir -p /opt/backup /etc/backup /var/log/backup /var/lib/backup /etc/backup/ssh_keys && \
+    chown -R backup:backup /opt/backup /etc/backup /var/log/backup /var/lib/backup
+
+# Copy backup scripts and configuration
+COPY backup-new.sh backup-metrics /opt/backup/
+COPY tests/ /opt/backup/tests/
+COPY containers/test-container.sh /opt/backup/
+RUN chmod +x /opt/backup/backup-new.sh /opt/backup/backup-metrics /opt/backup/tests/*.sh /opt/backup/test-container.sh
+
+# Create default backup configuration
+RUN cat > /etc/backup/backup.yaml << 'YAML_EOF'
+backup_base: "/var/lib/backup/data"
+lock_file: "/var/lib/backup/backup.lock"
+rsync_options: "-avz --stats --delete"
+log_level: "INFO"
+
+hosts:
+  client:
+    hostname: "client"
+    ssh_user: "testuser"
+    ssh_key: "/etc/backup/ssh_keys/backup_key"
+    ignore_ping: false
+    paths:
+      - path: "/home/testuser/data"
+        dest_subdir: "testuser-data"
+      - path: "/etc/hostname"
+        dest_subdir: "system-config"
+YAML_EOF
+
+# Create InfluxDB configuration
+RUN cat > /etc/backup/influxdb-config.yaml << 'YAML_EOF'
+influxdb:
+  url: "http://influxdb:8086"
+  token: "backup-test-token"
+  org: "backup-org"
+  bucket: "backup-metrics"
+
+systemd:
+  service_name: "backup"
+  journal_identifier: "backup"
+YAML_EOF
+
+# Generate SSH key for backup access
+RUN ssh-keygen -t rsa -b 2048 -f /etc/backup/ssh_keys/backup_key -N "" && \
+    chown -R backup:backup /etc/backup/ssh_keys
+
+# Setup systemd environment (minimal)
+RUN systemctl enable systemd-journald || true
+
+# Create test runner script
+RUN cat > /opt/backup/run-tests.sh << 'SCRIPT_EOF'
+#!/bin/bash
+cd /opt/backup
+echo "Starting containerized backup tests..."
+./test-container.sh
+SCRIPT_EOF
+
+RUN chmod +x /opt/backup/run-tests.sh
+
+# Set working directory and user
+WORKDIR /opt/backup
+USER backup
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD test -x /opt/backup/backup-new.sh && test -x /opt/backup/backup-metrics || exit 1
+
+# Default command
+CMD ["/bin/bash", "-c", "while true; do sleep 30; done"]

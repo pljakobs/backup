@@ -1,4 +1,7 @@
 #!/bin/bash
+
+# TEST_DESCRIPTION: Advanced run ID tracking and backup functionality
+# TEST_TIMEOUT: 180
 # Run ID Functionality Test Suite
 # Focused testing of run ID generation, logging, and metrics parsing
 

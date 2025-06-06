@@ -4,7 +4,7 @@ services:
   backup:
     build:
       context: .
-      dockerfile: containers/Containerfile.backup.new
+      dockerfile: containers/Containerfile.backup
     container_name: backup-test
     networks:
       - backup-network
@@ -25,11 +25,13 @@ services:
       - NET_RAW
     depends_on:
       - influxdb
-      - client1
+            - client1
       - client2
       - client3
+      - client4
+      - client5
 
-  client1:
+    client1:
     build:
       context: .
       dockerfile: containers/Containerfile.client
@@ -41,7 +43,7 @@ services:
       - client1-data:/home/testuser/data
       - ssh-keys:/shared/ssh-keys
     ports:
-      - "2201:22"
+      - "2222:22"
     environment:
       - CLIENT_ID=1
       - CLIENT_NAME=client1
@@ -58,7 +60,7 @@ services:
       - client2-data:/home/testuser/data
       - ssh-keys:/shared/ssh-keys
     ports:
-      - "2202:22"
+      - "2223:22"
     environment:
       - CLIENT_ID=2
       - CLIENT_NAME=client2
@@ -75,10 +77,44 @@ services:
       - client3-data:/home/testuser/data
       - ssh-keys:/shared/ssh-keys
     ports:
-      - "2203:22"
+      - "2224:22"
     environment:
       - CLIENT_ID=3
       - CLIENT_NAME=client3
+
+  client4:
+    build:
+      context: .
+      dockerfile: containers/Containerfile.client
+    container_name: backup-client4
+    hostname: client4
+    networks:
+      - backup-network
+    volumes:
+      - client4-data:/home/testuser/data
+      - ssh-keys:/shared/ssh-keys
+    ports:
+      - "2225:22"
+    environment:
+      - CLIENT_ID=4
+      - CLIENT_NAME=client4
+
+  client5:
+    build:
+      context: .
+      dockerfile: containers/Containerfile.client
+    container_name: backup-client5
+    hostname: client5
+    networks:
+      - backup-network
+    volumes:
+      - client5-data:/home/testuser/data
+      - ssh-keys:/shared/ssh-keys
+    ports:
+      - "2226:22"
+    environment:
+      - CLIENT_ID=5
+      - CLIENT_NAME=client5
 
   influxdb:
     build:
@@ -94,12 +130,12 @@ services:
       - influxdb-data:/var/lib/influxdb2
       - influxdb-config:/etc/influxdb2
     environment:
-      - INFLUXDB_INIT_MODE=setup
-      - INFLUXDB_INIT_USERNAME=admin
-      - INFLUXDB_INIT_PASSWORD=backup-admin-password
-      - INFLUXDB_INIT_ORG=backup-org
-      - INFLUXDB_INIT_BUCKET=backup-metrics
-      - INFLUXDB_INIT_ADMIN_TOKEN=backup-test-token
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=backup-admin-password
+      - DOCKER_INFLUXDB_INIT_ORG=backup-org
+      - DOCKER_INFLUXDB_INIT_BUCKET=backup-metrics
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=backup-test-token
 
   grafana:
     build:
@@ -133,3 +169,5 @@ volumes:
   client1-data:
   client2-data:
   client3-data:
+  client4-data:
+  client5-data:

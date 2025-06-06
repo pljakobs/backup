@@ -1,4 +1,7 @@
 #!/bin/bash
+
+# TEST_DESCRIPTION: Performance and stress testing
+# TEST_TIMEOUT: 300
 # Performance and Stress Test for Backup System
 # Tests system behavior under load and various edge cases
 

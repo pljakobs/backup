@@ -4,7 +4,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
-cd "$SCRIPT_DIR"
+BACKUP_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$BACKUP_DIR"
 
 # Colors for output
 RED='\033[0;31m'
@@ -55,6 +56,9 @@ create_network() {
 build_containers() {
     log "Building containers..."
     
+    currentDir=`pwd`
+
+    log "current directory $currentDir"
     # Build backup container
     log "Building backup container..."
     podman build -f containers/Containerfile.backup -t backup-test:latest .
@@ -101,7 +105,7 @@ start_influxdb() {
         -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=backup-test-token \
         -v influxdb-data:/var/lib/influxdb2 \
         -v influxdb-config:/etc/influxdb2 \
-        quay.io/influxdb/influxdb:v2.7-alpine
+        docker.io/influxdb:2.7-alpine
     
     # Wait for InfluxDB to be ready
     log "Waiting for InfluxDB to be ready..."
@@ -236,7 +240,7 @@ run_tests() {
     
     podman exec -it backup-test bash -c "
         cd /opt/backup
-        ./tests/run_all_tests.sh
+        ./tests/run-tests.sh
     "
 }
 

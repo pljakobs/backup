@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# TEST_DESCRIPTION: Help functionality and basic interface validation
 # Test script for verifying --help functionality of backup scripts
 # Tests both backup-new.sh and backup-metrics in containerized environment
 

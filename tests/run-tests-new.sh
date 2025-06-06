@@ -1,6 +1,6 @@
 #!/bin/bash
-# Master Test Orchestrator for Backup System
-# Runs all test suites in sequence and provides comprehensive reporting
+# Test Orchestrator for Backup System
+# Runs test suites individually or in groups with comprehensive reporting
 
 set -euo pipefail
 
@@ -14,17 +14,13 @@ BACKUP_DIR="$(dirname "$TEST_DIR")"
 REPORT_DIR="/tmp/backup-test-reports"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 FULL_REPORT="$REPORT_DIR/full_test_report_$TIMESTAMP.txt"
+YAML_CONFIG="$TEST_DIR/test-suites.yaml"
 
-# Test suite definitions by numeric prefix groups
-declare -A SUITE_GROUPS=(
-    ["10"]="Environment"
-    ["20"]="Connectivity"
-    ["30"]="User Interface"
-    ["40"]="Basic Functionality"
-    ["50"]="Advanced Functionality"
-    ["60"]="Performance"
-    ["70"]="Metrics"
-)
+# Test suite definitions - loaded from YAML or fallback
+declare -A SUITE_GROUPS=()
+declare -A SUITE_SHORTNAMES=()
+declare -A SUITE_DESCRIPTIONS=()
+declare -A SHORTNAME_TO_PREFIXES=()
 
 # Dynamic test discovery
 declare -A TEST_SCRIPTS=()
@@ -39,6 +35,69 @@ FAILED_SUITES=()
 SUITE_RESULTS=()
 
 # Test orchestration functions
+
+# YAML parser using yq for test suite configuration
+parse_yaml_config() {
+    local config_file="$1"
+    
+    # Initialize fallback values
+    SUITE_GROUPS=(
+        ["10"]="Environment"
+        ["20"]="Connectivity"
+        ["30"]="User Interface"
+        ["40"]="Basic Functionality"
+        ["50"]="Advanced Functionality"
+        ["60"]="Performance"
+        ["70"]="Metrics"
+    )
+    
+    if [[ ! -f "$config_file" ]]; then
+        print_warning "YAML config file not found: $config_file"
+        print_info "Using fallback suite definitions"
+        return 0
+    fi
+    
+    # Check if yq is available
+    if ! command -v yq >/dev/null 2>&1; then
+        print_warning "yq not found - using fallback suite definitions"
+        return 0
+    fi
+    
+    print_info "Loading test suite configuration from: $config_file"
+    
+    # Clear arrays
+    SUITE_GROUPS=()
+    SUITE_SHORTNAMES=()
+    SUITE_DESCRIPTIONS=()
+    SHORTNAME_TO_PREFIXES=()
+    
+    # Parse YAML file using yq
+    while IFS=$'\t' read -r prefix shortname description; do
+        [[ -z "$prefix" || -z "$shortname" || -z "$description" ]] && continue
+        
+        # Convert prefix pattern to actual prefixes (e.g., "1*" -> "10")
+        if [[ "$prefix" =~ ^([0-9]+)\*$ ]]; then
+            local base_prefix="${BASH_REMATCH[1]}"
+            local numeric_prefix="${base_prefix}0"
+            
+            SUITE_GROUPS["$numeric_prefix"]="$shortname"
+            SUITE_SHORTNAMES["$numeric_prefix"]="$shortname"
+            SUITE_DESCRIPTIONS["$numeric_prefix"]="$description"
+            
+            # Map shortname to prefixes
+            if [[ -n "${SHORTNAME_TO_PREFIXES[$shortname]:-}" ]]; then
+                SHORTNAME_TO_PREFIXES["$shortname"]+=" $numeric_prefix"
+            else
+                SHORTNAME_TO_PREFIXES["$shortname"]="$numeric_prefix"
+            fi
+        fi
+    done < <(yq eval '.suites[].suite | [.prefix, .shortname, .description] | @tsv' "$config_file")
+    
+    local loaded_suites=${#SUITE_GROUPS[@]}
+    local loaded_shortnames=${#SHORTNAME_TO_PREFIXES[@]}
+    
+    print_success "Loaded $loaded_suites suite definitions with $loaded_shortnames unique shortnames"
+}
 
 # Discover test scripts dynamically
 discover_test_scripts() {
@@ -92,6 +151,9 @@ discover_test_scripts() {
 # Initialize test environment
 init_test_environment() {
     print_header "Initializing Test Environment"
+    
+    # Load suite configuration from YAML
+    parse_yaml_config "$YAML_CONFIG"
     
     # Discover test scripts dynamically
     discover_test_scripts
@@ -325,7 +387,8 @@ cleanup_test_artifacts() {
 
 # Show help
 show_help() {
-    # First discover tests to show current ones
+    # First load configuration and discover tests to show current ones
+    parse_yaml_config "$YAML_CONFIG" >/dev/null 2>&1
     discover_test_scripts >/dev/null 2>&1
     
     cat << EOF
@@ -336,6 +399,8 @@ Usage: $0 [options] [tests/suites...]
 Options:
   --help, -h          Show this help message
   --list-suites       List available test suites and individual tests
+  --suite PREFIXES    Run all tests in specific suite(s) (comma-separated prefixes)
+  --suite-name NAME   Run all tests in specific suite by shortname
   --quick             Run only quick tests (skip performance tests)
   --cleanup-only      Only cleanup test artifacts
   --no-cleanup        Don't cleanup after tests
@@ -355,6 +420,15 @@ EOF
 
     cat << EOF
 
+Suite Short Names:
+EOF
+    for shortname in $(printf '%s\n' "${!SHORTNAME_TO_PREFIXES[@]}" | sort); do
+        local prefixes="${SHORTNAME_TO_PREFIXES[$shortname]}"
+        echo "  $shortname (prefixes: $prefixes)"
+    done
+
+    cat << EOF
+
 Individual Tests:
 EOF
     for test in $(printf '%s\n' "${!TEST_SCRIPTS[@]}" | sort); do
@@ -367,11 +441,84 @@ Examples:
   $0                           Run all test scripts
   $0 10-test_environment       Run only environment test
   $0 20-test_connectivity 30-test_help_functionality   Run specific tests
+  $0 --suite 20                Run all connectivity tests (20-* prefix)
+  $0 --suite 40,50             Run all basic and advanced functionality tests
+  $0 --suite-name Environment  Run all Environment tests
+  $0 --suite-name Connectivity,BasicFunctionality  Run multiple suite shortnames
   $0 --quick                   Run quick tests only (skip performance)
   $0 --list-suites             Show all available tests grouped by suite
   
 Report files are saved to: $REPORT_DIR
 EOF
+}
+
+# Get all tests for specified suite prefixes
+get_suite_tests() {
+    local prefixes="$1"
+    local suite_tests=()
+    
+    # Split comma-separated prefixes
+    IFS=',' read -ra PREFIX_ARRAY <<< "$prefixes"
+    
+    for prefix in "${PREFIX_ARRAY[@]}"; do
+        # Remove any whitespace
+        prefix=$(echo "$prefix" | tr -d ' ')
+        
+        # Validate prefix format (should be 2 digits)
+        if [[ ! "$prefix" =~ ^[0-9][0-9]$ ]]; then
+            echo "Error: Invalid suite prefix '$prefix'. Must be 2 digits (e.g., 10, 20, 30)" >&2
+            return 1
+        fi
+        
+        # Check if suite exists
+        if [[ -z "${SUITE_TESTS[$prefix]:-}" ]]; then
+            echo "Error: No tests found for suite prefix '$prefix'" >&2
+            echo "Available prefixes: $(printf '%s ' "${!SUITE_TESTS[@]}" | sort)" >&2
+            return 1
+        fi
+        
+        # Add tests from this suite
+        for test in ${SUITE_TESTS[$prefix]}; do
+            suite_tests+=("$test")
+        done
+    done
+    
+    # Return sorted unique tests
+    printf '%s\n' "${suite_tests[@]}" | sort -u
+}
+
+# Get all tests for specified suite shortnames
+get_suite_tests_by_shortname() {
+    local shortname_list="$1"
+    local suite_tests=()
+    
+    # Split comma-separated shortnames
+    IFS=',' read -ra shortnames <<< "$shortname_list"
+    
+    for shortname in "${shortnames[@]}"; do
+        # Strip whitespace
+        shortname=$(echo "$shortname" | xargs)
+        
+        # Check if shortname exists
+        if [[ -z "${SHORTNAME_TO_PREFIXES[$shortname]:-}" ]]; then
+            echo "Error: Unknown suite shortname: $shortname" >&2
+            echo "Available shortnames: $(printf '%s ' "${!SHORTNAME_TO_PREFIXES[@]}" | sort)" >&2
+            return 1
+        fi
+        
+        # Get prefixes for this shortname and add their tests
+        local prefixes="${SHORTNAME_TO_PREFIXES[$shortname]}"
+        for prefix in $prefixes; do
+            if [[ -n "${SUITE_TESTS[$prefix]:-}" ]]; then
+                for test in ${SUITE_TESTS[$prefix]}; do
+                    suite_tests+=("$test")
+                done
+            fi
+        done
+    done
+    
+    # Return sorted unique tests
+    printf '%s\n' "${suite_tests[@]}" | sort -u
 }
 
 # Parse command line arguments
@@ -381,7 +528,8 @@ parse_arguments() {
     local cleanup_only=false
     local quick_mode=false
     
-    # Discover tests first so we can validate arguments
+    # Load configuration and discover tests first so we can validate arguments
+    parse_yaml_config "$YAML_CONFIG" >/dev/null 2>&1
     discover_test_scripts >/dev/null 2>&1
     
     while [[ $# -gt 0 ]]; do
@@ -406,6 +554,38 @@ parse_arguments() {
             --quick)
                 quick_mode=true
                 shift
+                ;;
+            --suite)
+                if [[ -z "${2:-}" ]]; then
+                    echo "Error: --suite requires a prefix argument (e.g., 20 or 20,30,40)"
+                    exit 1
+                fi
+                # Get all tests for the specified suite prefixes
+                local suite_test_list
+                if ! suite_test_list=$(get_suite_tests "$2"); then
+                    exit 1
+                fi
+                # Add suite tests to our list
+                while IFS= read -r test; do
+                    [[ -n "$test" ]] && tests_to_run+=("$test")
+                done <<< "$suite_test_list"
+                shift 2
+                ;;
+            --suite-name)
+                if [[ -z "${2:-}" ]]; then
+                    echo "Error: --suite-name requires a shortname argument (e.g., Environment or Connectivity,BasicFunctionality)"
+                    exit 1
+                fi
+                # Get all tests for the specified suite shortnames
+                local suite_test_list
+                if ! suite_test_list=$(get_suite_tests_by_shortname "$2"); then
+                    exit 1
+                fi
+                # Add suite tests to our list
+                while IFS= read -r test; do
+                    [[ -n "$test" ]] && tests_to_run+=("$test")
+                done <<< "$suite_test_list"
+                shift 2
                 ;;
             --cleanup-only)
                 cleanup_only=true

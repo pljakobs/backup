@@ -1,0 +1,47 @@
+# Test Suite Configuration
+# This file defines the test suites and their organization
+# Format: prefix: "shortname" # description
+# Critical suites: if any test in a critical suite fails, the entire test run is aborted
+
+suites:
+  - suite:
+      prefix: "1*"
+      shortname: "Environment" 
+      description: "Environment and prerequisite validation tests"
+      critical: true
+      
+  - suite:
+      prefix: "2*"
+      shortname: "Connectivity"
+      description: "Network connectivity and SSH validation tests"
+      critical: true
+      
+  - suite:
+      prefix: "3*"
+      shortname: "UserInterface"
+      description: "User interface, help functionality, and basic interface validation tests"
+      critical: false
+      
+  - suite:
+      prefix: "4*"
+      shortname: "BasicFunctionality"
+      description: "Basic functionality and simple feature validation tests"
+      critical: false
+      
+  - suite:
+      prefix: "5*"
+      shortname: "AdvancedFunctionality"
+      description: "Advanced functionality and complex feature validation tests"
+      critical: false
+      
+  - suite:
+      prefix: "6*"
+      shortname: "Performance"
+      description: "Performance testing, stress testing, and resource validation"
+      critical: false
+      
+  - suite:
+      prefix: "7*"
+      shortname: "Metrics"
+      description: "Metrics collection, monitoring, and reporting validation tests"
+      critical: false

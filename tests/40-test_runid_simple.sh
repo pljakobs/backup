@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# TEST_DESCRIPTION: Simple run ID generation and format validation
 #
 # test_runid_simple.sh - Simple Run ID functionality tests
 #
@@ -276,17 +277,6 @@ test_runid_log_format() {
     return 0
 }
 
-# Main execution
-main() {
-    print_test_header "Simple Run ID Functionality Test Suite"
-    echo "Focused testing of run ID generation, format, and basic parsing"
-    echo
-    
-    TESTS_RUN=0
-    TESTS_PASSED=0
-    TESTS_FAILED=0
-    
-    # Check that scripts exist
 # Main function to run all tests
 main() {
     print_test_header "Simple Run ID Functionality Test Suite"

@@ -514,10 +514,11 @@ function backup_host() {
         # Add ownership handling options based on configuration
         if [[ "$preserve_ownership" == "false" ]]; then
             # Map all files to root ownership and fix permissions
-            rsync_cmd="$rsync_cmd --no-owner --no-group --chmod=D755,F644"
+            # Add --force-change to handle permission issues on destination
+            rsync_cmd="$rsync_cmd --no-owner --no-group --chmod=D755,F644 --force-change"
         else
             # Preserve original ownership but ensure we can write to directories
-            rsync_cmd="$rsync_cmd --chmod=Du+w"
+            rsync_cmd="$rsync_cmd --chmod=Du+rwx"
         fi
         
         if [[ -n "$path_rsync_path" && "$path_rsync_path" != "null" ]]; then
@@ -546,9 +547,13 @@ function backup_host() {
             print_dry_run "$rsync_cmd $source_path $dest_path"
             BACKUP_STATUS_VOLUME="success"
         else
-            # Ensure backup directory is writable by root before rsync
+            # Ensure backup directory has proper permissions before rsync
             if [[ -d "$dest_path" ]]; then
-                chmod -R u+w "$dest_path" 2>/dev/null || true
+                print_info "Fixing destination permissions before rsync..."
+                # Make directories readable, writable, and executable for owner
+                find "$dest_path" -type d -exec chmod u+rwx {} \; 2>/dev/null || true
+                # Make files readable and writable for owner  
+                find "$dest_path" -type f -exec chmod u+rw {} \; 2>/dev/null || true
             fi
             
             print_command "$rsync_cmd $source_path $dest_path"
@@ -593,11 +598,12 @@ function backup_host() {
             if [[ "$preserve_ownership" == "false" ]]; then
                 print_info "Fixing ownership and permissions for backup files..."
                 chown -R root:root "$dest_path" 2>/dev/null || true
+                # Ensure directories are always accessible (755) and files are readable (644)
                 find "$dest_path" -type d -exec chmod 755 {} \; 2>/dev/null || true
                 find "$dest_path" -type f -exec chmod 644 {} \; 2>/dev/null || true
             else
-                # Just ensure directories are writable for future backups
-                find "$dest_path" -type d -exec chmod u+w {} \; 2>/dev/null || true
+                # Just ensure directories are accessible for future backups
+                find "$dest_path" -type d -exec chmod u+rwx {} \; 2>/dev/null || true
             fi
             
             # Interpret rsync exit code

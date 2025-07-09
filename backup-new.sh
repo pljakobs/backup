@@ -515,10 +515,12 @@ function backup_host() {
         if [[ "$preserve_ownership" == "false" ]]; then
             # Map all files to root ownership and fix permissions
             # Add --force-change to handle permission issues on destination
-            rsync_cmd="$rsync_cmd --no-owner --no-group --chmod=D755,F644 --force-change"
+            # Add --perms to ensure permissions are handled properly
+            rsync_cmd="$rsync_cmd --no-owner --no-group --chmod=D755,F644 --force-change --perms"
         else
             # Preserve original ownership but ensure we can write to directories
-            rsync_cmd="$rsync_cmd --chmod=Du+rwx"
+            # Add --perms to ensure permissions are preserved properly
+            rsync_cmd="$rsync_cmd --chmod=Du+rwx --perms"
         fi
         
         if [[ -n "$path_rsync_path" && "$path_rsync_path" != "null" ]]; then
@@ -547,13 +549,71 @@ function backup_host() {
             print_dry_run "$rsync_cmd $source_path $dest_path"
             BACKUP_STATUS_VOLUME="success"
         else
-            # Ensure backup directory has proper permissions before rsync
-            if [[ -d "$dest_path" ]]; then
-                print_info "Fixing destination permissions before rsync..."
-                # Make directories readable, writable, and executable for owner
-                find "$dest_path" -type d -exec chmod u+rwx {} \; 2>/dev/null || true
-                # Make files readable and writable for owner  
-                find "$dest_path" -type f -exec chmod u+rw {} \; 2>/dev/null || true
+            # Configure SELinux for rsync if SELinux is enabled and we're running as root
+            if [[ $EUID -eq 0 ]] && command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" != "Disabled" ]]; then
+                print_info "Configuring SELinux for rsync backup (running as root)..."
+                print_info "SELinux status: $(getenforce)"
+                
+                # Check and enable rsync SELinux booleans that allow broader file access
+                if command -v getsebool >/dev/null 2>&1; then
+                    # Check current boolean states
+                    local rsync_anon_write=$(getsebool rsync_anon_write 2>/dev/null | awk '{print $3}' || echo "unknown")
+                    local rsync_full_access=$(getsebool rsync_full_access 2>/dev/null | awk '{print $3}' || echo "unknown")
+                    
+                    print_info "Current rsync_anon_write: $rsync_anon_write"
+                    print_info "Current rsync_full_access: $rsync_full_access"
+                    
+                    # Enable rsync_anon_write to allow rsync to write to any file type
+                    if [[ "$rsync_anon_write" != "on" ]]; then
+                        print_info "Enabling rsync_anon_write SELinux boolean..."
+                        if setsebool rsync_anon_write on 2>/dev/null; then
+                            print_success "Enabled rsync_anon_write"
+                        else
+                            print_warning "Failed to enable rsync_anon_write"
+                        fi
+                    else
+                        print_success "rsync_anon_write already enabled"
+                    fi
+                    
+                    # Enable rsync_full_access for broader permissions (if available)
+                    if [[ "$rsync_full_access" == "off" ]]; then
+                        print_info "Enabling rsync_full_access SELinux boolean..."
+                        if setsebool rsync_full_access on 2>/dev/null; then
+                            print_success "Enabled rsync_full_access"
+                        else
+                            print_info "rsync_full_access boolean not available or failed to set"
+                        fi
+                    elif [[ "$rsync_full_access" == "on" ]]; then
+                        print_success "rsync_full_access already enabled"
+                    fi
+                    
+                    # Set basic context on backup directory (much faster than recursive)
+                    if [[ -d "$dest_path" ]]; then
+                        # Only set context on the directory itself, not recursively
+                        chcon -t user_home_t "$dest_path" 2>/dev/null || chcon -t admin_home_t "$dest_path" 2>/dev/null || true
+                        chcon -t user_home_t "$backup_base" 2>/dev/null || chcon -t admin_home_t "$backup_base" 2>/dev/null || true
+                        
+                        print_info "Set directory context (non-recursive): $(ls -Zd "$dest_path" 2>/dev/null | awk '{print $1}' || echo 'unknown')"
+                    fi
+                else
+                    print_warning "SELinux tools not available, cannot configure rsync booleans"
+                fi
+                
+                # Check for recent SELinux denials
+                if command -v ausearch >/dev/null 2>&1; then
+                    local recent_denials=$(ausearch -m avc -ts recent 2>/dev/null | grep -E "(rsync|backup)" | wc -l || echo "0")
+                    if [[ "$recent_denials" -gt 0 ]]; then
+                        print_warning "Found $recent_denials recent SELinux denials related to rsync/backup"
+                        print_info "Check with: sudo ausearch -m avc -ts recent | grep -E '(rsync|backup)'"
+                    fi
+                fi
+            elif [[ $EUID -ne 0 ]]; then
+                # Only do permission fixes if not running as root
+                if [[ -d "$dest_path" ]]; then
+                    print_info "Fixing destination permissions (not running as root)..."
+                    find "$dest_path" -type d -exec chmod u+rwx {} \; 2>/dev/null || true
+                    find "$dest_path" -type f -exec chmod u+rw {} \; 2>/dev/null || true
+                fi
             fi
             
             print_command "$rsync_cmd $source_path $dest_path"
@@ -596,9 +656,8 @@ function backup_host() {
             
             # Fix permissions after rsync if preserve_ownership is false
             if [[ "$preserve_ownership" == "false" ]]; then
-                print_info "Fixing ownership and permissions for backup files..."
+                # Set consistent ownership and permissions for backup files
                 chown -R root:root "$dest_path" 2>/dev/null || true
-                # Ensure directories are always accessible (755) and files are readable (644)
                 find "$dest_path" -type d -exec chmod 755 {} \; 2>/dev/null || true
                 find "$dest_path" -type f -exec chmod 644 {} \; 2>/dev/null || true
             else
